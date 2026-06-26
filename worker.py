@@ -123,6 +123,50 @@ def site_name(raw):
                 if tail and not is_junk(tail) and len(tail) <= 45: return tail
     return ''
 
+ASSET_EXT = ('.css', '.js', '.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.ico', '.woff', '.woff2', '.ttf', '.mp4', '.pdf', '.json', '.xml')
+EMAIL_BADDOM = ('sentry', 'wixpress', 'example.', 'schema.org', 'w3.org', 'googleapis', 'gstatic', 'cloudflare',
+                'jquery', 'bootstrap', 'fontawesome', '.min.', 'domain.com', 'email.com', 'yourdomain', 'sentry.io', 'gov.uk')
+EMAIL_RE = re.compile(r'[a-z0-9][a-z0-9._%+\-]*@[a-z0-9.\-]+\.[a-z]{2,}', re.I)
+PHONE_RE = re.compile(r'(?:\+44\s?|\b0)(?:\d[\d\s().\-]{7,12}\d)')
+PREF_LOCAL = ('info', 'hello', 'contact', 'enquiries', 'enquiry', 'admin', 'office', 'hi', 'team', 'bookings', 'reception')
+PLACEHOLDER_PHONES = {'01234567890', '02012345678', '07123456789', '00000000000', '01111111111', '07000000000', '07700900000'}
+
+def _registrable(dom):
+    return '.'.join((dom or '').lower().split('.')[-2:])
+
+def contacts(raw, org_domain):
+    """Pull a VALIDATED email + phone from an org's own page. Rejects asset strings, placeholders, junk."""
+    if not raw: return None, None
+    text = html.unescape(raw)
+    # email
+    email = None
+    cands = []
+    for m in EMAIL_RE.findall(text):
+        e = m.lower().strip('.')
+        dom = e.split('@')[1]
+        if any(e.endswith(x) or ('.' + x.strip('.')) in dom for x in ASSET_EXT): continue
+        if dom.endswith(ASSET_EXT): continue
+        if any(b in e for b in EMAIL_BADDOM): continue
+        if dom.count('.') == 0 or len(dom.split('.')[-1]) < 2: continue
+        if re.search(r'\d{4,}', e.split('@')[0]): continue  # filename-ish local part
+        cands.append(e)
+    if cands:
+        org_reg = _registrable(org_domain)
+        own = [e for e in cands if _registrable(e.split('@')[1]) == org_reg]
+        pref = [e for e in cands if e.split('@')[0] in PREF_LOCAL]
+        email = (own and (next((e for e in own if e.split('@')[0] in PREF_LOCAL), own[0]))) or (pref[0] if pref else cands[0])
+    # phone (UK)
+    phone = None
+    for m in PHONE_RE.findall(text):
+        d = re.sub(r'\D', '', m)
+        if d.startswith('44'): d = '0' + d[2:]
+        if len(d) not in (10, 11) or not d.startswith('0'): continue
+        if d[1] not in '12378': continue
+        if d in PLACEHOLDER_PHONES or len(set(d)) <= 2: continue
+        if d in '0123456789012345' or d in '0987654321098765': continue  # sequential
+        phone = d; break
+    return email, phone
+
 def brand(titles, dom):
     counts = {}
     for t in titles:
@@ -187,6 +231,8 @@ def discover_web(venue, pc):
         rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
         if tie:
             rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc)
+            if not is_agg(c['domain']):  # only trust contacts from the org's own site, not directories
+                rec['email'], rec['phone'] = contacts(raw, c['domain'])
         else:
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
         return rec  # raw HTML dropped here
@@ -200,9 +246,12 @@ def discover_web(venue, pc):
                         'url': r['url'], 'snippet': r['snippet'], 'evidence': r.get('evidence', '')})
         else:
             d = byd.setdefault(r['domain'], {'titles': [], 'tie': r['tie'], 'url': r['url'],
-                                             'snippet': r['snippet'], 'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', '')})
+                                             'snippet': r['snippet'], 'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', ''),
+                                             'email': r.get('email'), 'phone': r.get('phone')})
             d['titles'].append(r['title'])
             if not d.get('sitename'): d['sitename'] = r.get('sitename', '')
+            if not d.get('email'): d['email'] = r.get('email')
+            if not d.get('phone'): d['phone'] = r.get('phone')
             if r['tie'] == 'postcode': d['tie'] = 'postcode'
     # 1-level crawl: org pages whose venue mention is on a sub-page ("where we meet"/timetable)
     targets = []
@@ -214,12 +263,14 @@ def discover_web(venue, pc):
         dom, title, su = t
         _, raw = fetch(su)
         tie = tie_kind(page_blob(raw, '', title), *vmeta)
-        return (dom, title, su, tie, site_name(raw) if tie else '', page_evidence(raw, venue, pc) if tie else '')
+        if not tie: return (dom, title, su, None, '', '', None, None)
+        em, ph = contacts(raw, dom)
+        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph)
     if targets:
         with cf.ThreadPoolExecutor(max_workers=16) as ex:
-            for dom, title, su, tie, sname, ev in ex.map(process_sub, targets):
+            for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
                 if tie and dom not in byd:
-                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev}
+                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
     out, seen_n = [], set()
     for dom, d in byd.items():
         nm = d.get('sitename') or brand(d['titles'], dom)
@@ -228,7 +279,8 @@ def discover_web(venue, pc):
         if not k or k in seen_n: continue
         seen_n.add(k)
         out.append({'name': nm, 'domain': dom, 'tie': d['tie'], 'url': d['url'],
-                    'snippet': d.get('snippet', ''), 'evidence': d.get('evidence', ''), 'src': 'dataforseo'})
+                    'snippet': d.get('snippet', ''), 'evidence': d.get('evidence', ''),
+                    'email': d.get('email'), 'phone': d.get('phone'), 'src': 'dataforseo'})
     for r in agg:
         if is_junk(r['name']) or collapse(r['name']) in vcol or vcol in collapse(r['name']): continue
         k = collapse(r['name'])[:20]
@@ -356,7 +408,8 @@ def to_result(c):
     name = c['name']
     pid = c.get('place_id') or (synth('vdb', str(c['db_id'])) if c.get('db_id') else synth(c['src'][:3], (c.get('url') or '') + '|' + (c.get('domain') or name)))
     return {
-        "company_name": name, "address": None, "postcode": None, "city": None, "phone_number": None,
+        "company_name": name, "address": None, "postcode": None, "city": None,
+        "phone_number": c.get('phone'), "email": c.get('email'),
         "website": c.get('website') or (c.get('url') if c['src'] == 'dataforseo' else None),
         "facebook_url": c['url'] if c['src'] == 'facebook_post' else None,
         "activity_description": c.get('snippet') or None, "additional_information": c.get('url') or None,
