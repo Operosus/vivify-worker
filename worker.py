@@ -231,8 +231,11 @@ def discover_web(venue, pc):
         rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
         if tie:
             rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc)
-            if not is_agg(c['domain']):  # only trust contacts from the org's own site, not directories
+            # own site OR a charity/church register page (those list the org's own contact) — not class/sport directories
+            if not is_agg(c['domain']) or 'charitycommission' in c['domain'] or 'findachurch' in c['domain']:
                 rec['email'], rec['phone'] = contacts(raw, c['domain'])
+                if not is_agg(c['domain']) and not rec.get('email') and not rec.get('phone'):
+                    rec['clinks'] = sublinks(raw, c['url'], c['domain'], ['contact', 'about'])
         else:
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
         return rec  # raw HTML dropped here
@@ -243,15 +246,17 @@ def discover_web(venue, pc):
         if not r['tie']: continue
         if is_agg(r['domain']):
             agg.append({'name': brand([r['title']], r['domain']), 'domain': r['domain'], 'tie': r['tie'],
-                        'url': r['url'], 'snippet': r['snippet'], 'evidence': r.get('evidence', '')})
+                        'url': r['url'], 'snippet': r['snippet'], 'evidence': r.get('evidence', ''),
+                        'email': r.get('email'), 'phone': r.get('phone')})
         else:
             d = byd.setdefault(r['domain'], {'titles': [], 'tie': r['tie'], 'url': r['url'],
                                              'snippet': r['snippet'], 'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', ''),
-                                             'email': r.get('email'), 'phone': r.get('phone')})
+                                             'email': r.get('email'), 'phone': r.get('phone'), 'clinks': r.get('clinks', [])})
             d['titles'].append(r['title'])
             if not d.get('sitename'): d['sitename'] = r.get('sitename', '')
             if not d.get('email'): d['email'] = r.get('email')
             if not d.get('phone'): d['phone'] = r.get('phone')
+            if not d.get('clinks'): d['clinks'] = r.get('clinks', [])
             if r['tie'] == 'postcode': d['tie'] = 'postcode'
     # 1-level crawl: org pages whose venue mention is on a sub-page ("where we meet"/timetable)
     targets = []
@@ -271,6 +276,18 @@ def discover_web(venue, pc):
             for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
+    # Contact backfill: orgs that tied but exposed no contact on the main page — read their /contact page
+    backfill = [(dom, d['clinks'][0]) for dom, d in byd.items()
+                if not d.get('email') and not d.get('phone') and d.get('clinks')]
+    if backfill:
+        def get_contact(t):
+            dom, su = t
+            _, raw = fetch(su)
+            return (dom, *contacts(raw, dom))
+        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+            for dom, em, ph in ex.map(get_contact, backfill):
+                if em and not byd[dom].get('email'): byd[dom]['email'] = em
+                if ph and not byd[dom].get('phone'): byd[dom]['phone'] = ph
     out, seen_n = [], set()
     for dom, d in byd.items():
         nm = d.get('sitename') or brand(d['titles'], dom)
@@ -302,7 +319,8 @@ def db_postcode(pc):
         if k in seen: continue
         seen.add(k)
         out.append({'name': nm, 'domain': '', 'tie': 'postcode', 'url': r.get('website') or '',
-                    'snippet': '', 'evidence': '', 'src': 'venue_db', 'db_id': r.get('id'), 'website': r.get('website')})
+                    'snippet': '', 'evidence': '', 'src': 'venue_db', 'db_id': r.get('id'), 'website': r.get('website'),
+                    'email': r.get('email'), 'phone': r.get('phone_number')})
     return out
 
 def fb_posts(venue, pc):
@@ -324,8 +342,14 @@ def fb_posts(venue, pc):
         k = collapse(nm)[:20]
         if not k or k in seen or is_junk(nm): continue
         seen.add(k)
+        ts = p.get('timestamp') or p.get('time') or p.get('date')
+        evdate = None
+        try:
+            if isinstance(ts, (int, float)): evdate = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts if ts < 1e11 else ts/1000))
+            elif isinstance(ts, str) and ts: evdate = ts
+        except Exception: evdate = None
         out.append({'name': nm, 'domain': 'facebook', 'tie': 'venue', 'url': a.get('url') or '',
-                    'snippet': msg[:280], 'evidence': msg[:200], 'src': 'facebook_post'})
+                    'snippet': msg[:280], 'evidence': msg[:200], 'evidence_date': evdate, 'src': 'facebook_post'})
     return out
 
 # ---------------- LLM gate ----------------
@@ -416,7 +440,7 @@ def to_result(c):
         "activity_type": c.get('category') or None, "place_id": pid,
         "evidence_source": c['src'], "evidence_url": c.get('url') or None, "source_url": c.get('url') or None,
         "evidence_text": c.get('evidence') or c.get('snippet') or None, "evidence_image_url": None,
-        "evidence_date": None, "confidence_tier": c['tier'],
+        "evidence_date": c.get('evidence_date'), "confidence_tier": c['tier'],
     }
 
 def run(sid):
