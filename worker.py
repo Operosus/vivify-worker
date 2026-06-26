@@ -20,6 +20,8 @@ DFS_AUTH = base64.b64encode(f"{ENV['DATAFORSEO_LOGIN']}:{ENV['DATAFORSEO_PASSWOR
 SUPA, SKEY = ENV['SUPABASE_URL'], ENV['SUPABASE_KEY']
 APIFY = ENV.get('APIFY_TOKEN', '')
 OPENAI_KEY = ENV.get('OPENAI_API_KEY', '') or os.environ.get('OPENAI_API_KEY', '')
+import functools
+print = functools.partial(print, flush=True)
 
 # ---------------- helpers ----------------
 def collapse(s): return re.sub(r'[^a-z0-9]', '', (s or '').lower())
@@ -87,7 +89,7 @@ def dfs(kw, depth=30, retries=2):
 def fetch(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        return url, urllib.request.urlopen(req, timeout=12).read()[:700000].decode('utf-8', 'ignore')
+        return url, urllib.request.urlopen(req, timeout=12).read()[:400000].decode('utf-8', 'ignore')
     except Exception:
         return url, ''
 
@@ -175,39 +177,49 @@ def discover_web(venue, pc):
             raw.append(r)
     cands = [r for r in raw if not noisy(r['domain']) and 'facebook.com' not in r['domain']]
     cands.sort(key=lambda c: ('charitycommission' in c['domain']) or (pcol in collapse(c['title']+c['snippet'])) or (vcol in collapse(c['title']+c['snippet'])), reverse=True)
-    cands = cands[:350]
-    pages = {}
-    with cf.ThreadPoolExecutor(max_workers=20) as ex:
-        for u, rh in ex.map(fetch, [c['url'] for c in cands]): pages[u] = rh
-    byd, agg = {}, []
-    for c in cands:
-        blob = page_blob(pages.get(c['url'], ''), c['snippet'], c['title'])
-        tie = tie_kind(blob, vcol, pcol, vtoks, oc)
-        if not tie: continue
-        if is_agg(c['domain']):
-            agg.append({'name': brand([c['title']], c['domain']), 'domain': c['domain'], 'tie': tie, 'url': c['url'],
-                        'snippet': c['snippet'], 'evidence': page_evidence(pages.get(c['url'], ''), venue, pc)})
+    cands = cands[:200]
+    vmeta = (vcol, pcol, vtoks, oc)
+    # Process each page AS IT IS FETCHED and discard the HTML — never hold all pages in memory
+    # (that OOM-killed the worker on the 512MB instance). Each record is small.
+    def process_main(c):
+        _, raw = fetch(c['url'])
+        tie = tie_kind(page_blob(raw, c['snippet'], c['title']), *vmeta)
+        rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
+        if tie:
+            rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc)
         else:
-            d = byd.setdefault(c['domain'], {'titles': [], 'tie': tie, 'url': c['url'], 'snippet': c['snippet'], 'raw': pages.get(c['url'], ''), 'sitename': site_name(pages.get(c['url'], ''))})
-            d['titles'].append(c['title'])
-            if not d.get('sitename'): d['sitename'] = site_name(pages.get(c['url'], ''))
-            if tie == 'postcode': d['tie'] = 'postcode'
-    # 1-level crawl for org pages that didn't tie on the main page
+            rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
+        return rec  # raw HTML dropped here
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(process_main, cands))
+    byd, agg = {}, []
+    for r in results:
+        if not r['tie']: continue
+        if is_agg(r['domain']):
+            agg.append({'name': brand([r['title']], r['domain']), 'domain': r['domain'], 'tie': r['tie'],
+                        'url': r['url'], 'snippet': r['snippet'], 'evidence': r.get('evidence', '')})
+        else:
+            d = byd.setdefault(r['domain'], {'titles': [], 'tie': r['tie'], 'url': r['url'],
+                                             'snippet': r['snippet'], 'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', '')})
+            d['titles'].append(r['title'])
+            if not d.get('sitename'): d['sitename'] = r.get('sitename', '')
+            if r['tie'] == 'postcode': d['tie'] = 'postcode'
+    # 1-level crawl: org pages whose venue mention is on a sub-page ("where we meet"/timetable)
     targets = []
-    for c in cands:
-        if c['domain'] in byd or is_agg(c['domain']): continue
-        for su in sublinks(pages.get(c['url'], ''), c['url'], c['domain'], vtoks + [oc]):
-            targets.append((c['domain'], c['title'], su))
-    targets = targets[:150]
+    for r in results:
+        if r['tie'] or r['domain'] in byd or is_agg(r['domain']): continue
+        for su in r.get('links', []): targets.append((r['domain'], r['title'], su))
+    targets = targets[:120]
+    def process_sub(t):
+        dom, title, su = t
+        _, raw = fetch(su)
+        tie = tie_kind(page_blob(raw, '', title), *vmeta)
+        return (dom, title, su, tie, site_name(raw) if tie else '', page_evidence(raw, venue, pc) if tie else '')
     if targets:
-        sub = {}
-        with cf.ThreadPoolExecutor(max_workers=20) as ex:
-            for u, rh in ex.map(fetch, [t[2] for t in targets]): sub[u] = rh
-        for dom, title, su in targets:
-            if dom in byd: continue
-            blob = page_blob(sub.get(su, ''), '', title)
-            tie = tie_kind(blob, vcol, pcol, vtoks, oc)
-            if tie: byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'raw': sub.get(su, '')}
+        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+            for dom, title, su, tie, sname, ev in ex.map(process_sub, targets):
+                if tie and dom not in byd:
+                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev}
     out, seen_n = [], set()
     for dom, d in byd.items():
         nm = d.get('sitename') or brand(d['titles'], dom)
@@ -216,7 +228,7 @@ def discover_web(venue, pc):
         if not k or k in seen_n: continue
         seen_n.add(k)
         out.append({'name': nm, 'domain': dom, 'tie': d['tie'], 'url': d['url'],
-                    'snippet': d.get('snippet', ''), 'evidence': page_evidence(d.get('raw', ''), venue, pc), 'src': 'dataforseo'})
+                    'snippet': d.get('snippet', ''), 'evidence': d.get('evidence', ''), 'src': 'dataforseo'})
     for r in agg:
         if is_junk(r['name']) or collapse(r['name']) in vcol or vcol in collapse(r['name']): continue
         k = collapse(r['name'])[:20]
