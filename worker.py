@@ -125,9 +125,13 @@ def dfs(kw, depth=30, retries=2):
         try:
             d = json.load(urllib.request.urlopen(r, timeout=60))
             task = d['tasks'][0]
+            cost = float(task.get('cost', 0) or 0)
+            res = task.get('result') or []
+            if not res:  # query ran and returned nothing — a retry just pays for the same empty answer
+                return [], cost
             items = [{"url": i.get('url'), "title": i.get('title') or '', "snippet": i.get('description') or ''}
-                     for i in (task['result'][0].get('items') or []) if i.get('type') == 'organic' and i.get('url')]
-            return items, float(task.get('cost', 0) or 0)
+                     for i in (res[0].get('items') or []) if i.get('type') == 'organic' and i.get('url')]
+            return items, cost
         except Exception as e:
             if attempt == retries: sys.stderr.write(f"dfs err [{kw[:30]}]: {e}\n"); return [], 0.0
             time.sleep(1.5)
@@ -280,8 +284,10 @@ def discover_web(venue, pc, own=''):
     vcol, pcol, vtoks, oc = collapse(venue), collapse(pc), vtokens(venue), outcode(pc)
     ownreg = _registrable(own) if own else ''
     raw, seen, cost = [], set(), 0.0
-    for q in queries_for(venue, pc, own):
-        items, qcost = dfs(q)
+    qs = queries_for(venue, pc, own)
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:  # ~45 queries; sequential made a search take 20 minutes
+        answers = list(ex.map(dfs, qs))
+    for items, qcost in answers:
         cost += qcost
         for r in items:
             if r['url'] in seen: continue
