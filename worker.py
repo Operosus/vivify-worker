@@ -657,6 +657,11 @@ def run(sid):
     venue = (s.get('venue_name') or s.get('search_name') or '').strip()
     pc = (s.get('postcode') or '').strip()
     print(f"[{sid}] {venue} ({pc})")
+    # No postcode, no search. The postcode is the only thing that ties evidence to THIS venue rather
+    # than a same-named place elsewhere, and running without one burns money on unusable results.
+    if not UKPC_RE.fullmatch((pc or '').strip()):
+        print(f"  refusing to run: '{pc}' is not a valid UK postcode")
+        set_status(sid, 'error'); return
     set_status(sid, 'searching')
     cname, cpc, own = resolve_venue(venue, pc)
     print(f"  places={'on' if GPLACES else 'OFF'} resolved={cname!r} {cpc!r} own={own!r}")
