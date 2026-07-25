@@ -359,27 +359,6 @@ def discover_web(venue, pc, own=''):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
     print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
-    t3 = time.time()
-    # Contact backfill: orgs that tied but exposed no contact yet — read every plausible contact page.
-    # Contact coverage is the whole point of a lead (a name with no way to reach them is not actionable),
-    # so this goes wider than the one linked page it used to try: all contact-ish links, then the
-    # conventional paths, then the site root.
-    GUESS = ['/contact', '/contact/', '/contact-us', '/contact-us/', '/about', '/about-us', '/']
-    backfill = []
-    for dom, d in byd.items():
-        if not dom or d.get('email'): continue
-        urls = list(dict.fromkeys((d.get('clinks') or [])[:3] + [f"https://{dom}{p}" for p in GUESS]))
-        for u in urls[:7]: backfill.append((dom, u))
-    if backfill:
-        def get_contact(t):
-            dom, su = t
-            _, raw = fetch(su)
-            return (dom, *contacts(raw, dom))
-        with cf.ThreadPoolExecutor(max_workers=16) as ex:
-            for dom, em, ph in ex.map(get_contact, backfill):
-                if em and not byd[dom].get('email'): byd[dom]['email'] = em
-                if ph and not byd[dom].get('phone'): byd[dom]['phone'] = ph
-    print(f"  contacts: {len(backfill)} pages in {time.time()-t3:.0f}s")
     out, seen_n = [], set()
     for dom, d in byd.items():
         nm = d.get('sitename') or brand(d['titles'], dom)
@@ -389,7 +368,8 @@ def discover_web(venue, pc, own=''):
         seen_n.add(k)
         out.append({'name': nm, 'domain': dom, 'tie': d['tie'], 'url': d['url'],
                     'snippet': d.get('snippet', ''), 'evidence': d.get('evidence', ''),
-                    'email': d.get('email'), 'phone': d.get('phone'), 'src': 'dataforseo'})
+                    'email': d.get('email'), 'phone': d.get('phone'), 'clinks': d.get('clinks', []),
+                    'src': 'dataforseo'})
     for r in agg:
         if is_junk(r['name']) or collapse(r['name']) in vcol or vcol in collapse(r['name']): continue
         # On a directory page the hirer is the org LISTED, never the directory — drop Footyaddicts,
@@ -401,6 +381,28 @@ def discover_web(venue, pc, own=''):
         if k in seen_n: continue
         seen_n.add(k); r['src'] = 'dataforseo'; out.append(r)
     return out, round(cost, 4)
+
+CONTACT_PATHS = ['/contact', '/contact-us', '/about', '/']
+def fill_contacts(cands):
+    """Chase a contact for the candidates that PASSED the gate only.
+    Doing this for every tied domain meant ~800 concurrent page fetches and knocked the instance over;
+    the survivors are ~15 rows, and they are the only ones anyone will ever ring."""
+    todo = []
+    for i, c in enumerate(cands):
+        dom = c.get('domain') or ''
+        if not dom or dom == 'facebook' or c.get('email') or is_agg(dom): continue
+        urls = list(dict.fromkeys((c.get('clinks') or [])[:2] + [f"https://{dom}{p}" for p in CONTACT_PATHS]))
+        for u in urls[:5]: todo.append((i, dom, u))
+    if not todo: return 0
+    def get(t):
+        i, dom, su = t
+        _, raw = fetch(su)
+        return (i, *contacts(raw, dom))
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for i, em, ph in ex.map(get, todo):
+            if em and not cands[i].get('email'): cands[i]['email'] = em
+            if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
+    return len(todo)
 
 def db_postcode(pc):
     req = urllib.request.Request(f"{SUPA}/rest/v1/rpc/find_venue_hirers_by_postcode",
@@ -573,11 +575,15 @@ def run(sid):
     cands = web + db + fb
     print(f"  candidates: web={len(web)} db={len(db)} fb={len(fb)} | gate={'gpt-4o' if OPENAI_KEY else 'DETERMINISTIC(no key)'}")
     verdicts, gate_cost = gate(cands, venue, pc)
-    kept = []
+    survivors = []
     for c, (ok, conf, cat) in zip(cands, verdicts):
         if not ok: continue
         c['tier'] = conf or ('confirmed' if c['tie'] == 'postcode' else 'likely'); c['category'] = cat
-        kept.append(to_result(c))
+        survivors.append(c)
+    t_c = time.time()
+    pages = fill_contacts(survivors)
+    print(f"  contacts: {pages} pages in {time.time()-t_c:.0f}s")
+    kept = [to_result(c) for c in survivors]
     apify_cost = 0.05 if fb else 0.0
     g_calls = 1 if GPLACES else 0
     g_cost = round(0.032 * g_calls, 4)  # Places Text Search
