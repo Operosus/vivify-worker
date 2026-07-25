@@ -140,7 +140,7 @@ def dfs(kw, depth=30, retries=2):
 def fetch(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        return url, urllib.request.urlopen(req, timeout=12).read()[:800000].decode('utf-8', 'ignore')
+        return url, urllib.request.urlopen(req, timeout=12).read()[:250000].decode('utf-8', 'ignore')
     except Exception:
         return url, ''
 
@@ -319,7 +319,9 @@ def discover_web(venue, pc, own=''):
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
         return rec  # raw HTML dropped here
     t1 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+    # 8 workers, not 16: one shared CPU, and saturating it starved the HTTP health check
+    # until Render killed the instance mid-search.
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(process_main, cands))
     print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
     byd, agg = {}, []
@@ -354,7 +356,7 @@ def discover_web(venue, pc, own=''):
         return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph)
     t2 = time.time()
     if targets:
-        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
             for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
