@@ -62,7 +62,9 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r"^(baby|toddler|kids|children'?s) .* classes", r'^classes (in|near)', r'^things to do',
     # session descriptions and age groups are not organisations
     r'^u\d{1,2}\b', r'^(under|year) \d', r'^\w+ (schools?|clubs?|classes) in ', r'training$', r'^(junior|senior|adult)s? ',
-    r'^(winter|summer|spring|autumn) ', r'^(half.term|holiday) ', r'^book ', r'^join ', r'^register ']]
+    r'^(winter|summer|spring|autumn) ', r'^(half.term|holiday) ', r'^book ', r'^join ', r'^register ',
+    r'showcase$', r'\bshowcase\b', r'open day', r'presentation (evening|night)', r'fun day', r'taster session',
+    r'(christmas|easter|summer) (show|fair|fayre|party)']]
 # A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
 BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
                  'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
