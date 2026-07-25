@@ -357,9 +357,16 @@ def queries_for(venue, pc, own=''):
     acts = ['football','netball','basketball','cricket','gymnastics','dance','ballet','karate','martial arts','tuition',
             'language school','saturday school','supplementary school','madrasah','quran','persian school','tamil school',
             'german saturday school','korean church','church','scouts','toddler group','holiday camp','music lessons',
-            'drama','classes','club','academy','timetable']
+            'drama','classes','club','academy','timetable',
+            # widened after Harrytown came back thin: these are the groups that actually book school halls
+            'brownies','guides','cubs','youth club','boxing','taekwondo','ju jitsu','judo','cheerleading',
+            'trampolining','athletics','walking football','futsal','volleyball','table tennis','badminton',
+            'slimming world','weight watchers','bootcamp','zumba','pilates','yoga','choir','brass band',
+            'orchestra','amateur dramatics','bridge club','bingo','prayer','mosque','sunday school','play group']
     q = [f'{venue} {ex}', f'{venue} {pc} {ex}'] + [f'{a} {venue} {ex}' for a in acts]
     q += [f'{a} "{venue}" {ex}' for a in ['madrasah','tamil school','persian school','german saturday school','church','football','dance']]
+    # phrasing hirers actually use about where they meet
+    q += [f'"{p} {venue}"' for p in ['meets at', 'sessions at', 'based at', 'training at', 'classes at', 'every week at']]
     q += [f'"{pc}" charity', f'"{pc}" church', f'"{pc}" club', f'"{pc}" academy',
           f'site:register-of-charities.charitycommission.gov.uk "{pc}"', f'site:findachurch.co.uk "{pc}"']
     q += [f'site:{d} "{venue}"' for d in ['classforkids.io','happity.co.uk','playfootball.net','clubspark.lta.org.uk','pitchfinder.org.uk']]
@@ -390,7 +397,7 @@ def discover_web(venue, pc, own=''):
     cands = [r for r in raw if not noisy(r['domain']) and 'facebook.com' not in r['domain']
              and not (ownreg and _registrable(r['domain']) == ownreg)]
     cands.sort(key=lambda c: ('charitycommission' in c['domain']) or (pcol in collapse(c['title']+c['snippet'])) or (vcol in collapse(c['title']+c['snippet'])), reverse=True)
-    cands = cands[:200]
+    cands = cands[:280]
     vmeta = (vcol, pcol, vtoks, oc)
     # Process each page AS IT IS FETCHED and discard the HTML — never hold all pages in memory
     # (that OOM-killed the worker on the 512MB instance). Each record is small.
@@ -502,6 +509,38 @@ def fill_contacts(cands):
             if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
     return len(todo)
 
+DEDUPE_STOP = {'the','and','of','in','at','uk','ltd','limited','cic','stockport','manchester','london','group'}
+def _key_tokens(name):
+    return {t for t in re.split(r'[^a-z0-9]+', (name or '').lower()) if len(t) > 2 and t not in DEDUPE_STOP}
+
+def merge_duplicates(cands):
+    """One hirer often surfaces under several names — "Boutique Baby Sale" and "Boutique Baby Sale
+    Stockport Chorlton and Altrincham" are the same business, and a list that shows both looks careless.
+    Merge when one name's words are contained in the other's, or when they share a domain, keeping the
+    richer record and carrying across whatever contact or evidence the other one had."""
+    out = []
+    for c in sorted(cands, key=lambda x: (-len(x.get('evidence') or ''), len(x.get('name') or ''))):
+        toks, dom = _key_tokens(c.get('name')), (c.get('domain') or '')
+        hit = None
+        for o in out:
+            otoks = _key_tokens(o.get('name'))
+            if not toks or not otoks: continue
+            same_domain = dom and dom not in ('facebook', '') and dom == o.get('domain')
+            contained = toks <= otoks or otoks <= toks
+            overlap = len(toks & otoks) / max(1, min(len(toks), len(otoks)))
+            if same_domain or contained or overlap >= 0.8:
+                hit = o; break
+        if hit is None:
+            out.append(c); continue
+        for f in ('email', 'phone', 'website', 'evidence_date', 'image'):
+            if not hit.get(f) and c.get(f): hit[f] = c[f]
+        # keep the fuller proof, and remember the other source so the row still shows both
+        if len(c.get('evidence') or '') > len(hit.get('evidence') or ''):
+            hit['evidence'], hit['evidence_date'] = c.get('evidence'), c.get('evidence_date') or hit.get('evidence_date')
+        if len(c.get('name') or '') > len(hit.get('name') or '') and not is_junk(c.get('name')):
+            hit['name'] = c['name']
+    return out
+
 def db_postcode(pc):
     req = urllib.request.Request(f"{SUPA}/rest/v1/rpc/find_venue_hirers_by_postcode",
         data=json.dumps({"p_postcode": pc}).encode(),
@@ -518,6 +557,112 @@ def db_postcode(pc):
         out.append({'name': nm, 'domain': '', 'tie': 'postcode', 'url': r.get('website') or '',
                     'snippet': '', 'evidence': '', 'src': 'venue_db', 'db_id': r.get('id'), 'website': r.get('website'),
                     'email': r.get('email'), 'phone': r.get('phone_number')})
+    return out
+
+LETTINGS_HINT = re.compile(r'(letting|hire|community|club|facilit|what.?s.on|partner|user|activities|out.of.hours)', re.I)
+def venue_own_site(venue, pc, own):
+    """Read the venue's OWN lettings and community pages and ask who is named on them.
+
+    Schools list their regular hirers on their own site far more often than the hirers publish it
+    themselves, and we exclude that domain from the search queries (so the school's pages don't crowd
+    out everyone else), which meant we were never reading the single best page. This puts it back."""
+    if not own or not OPENAI_KEY: return [], 0.0
+    root = f"https://{own}/"
+    _, raw = fetch(root)
+    if not raw: return [], 0.0
+    pages, seen = [], set()
+    for m in re.finditer(r'(?is)<a\b[^>]*href=["\']([^"\'#]+)["\'][^>]*>(.*?)</a>', raw):
+        href, anchor = m.group(1), re.sub(r'<[^>]+>', ' ', m.group(2))
+        if not LETTINGS_HINT.search(href + ' ' + anchor): continue
+        full = urllib.parse.urljoin(root, href)
+        if urllib.parse.urlparse(full).netloc.lower().replace('www.', '') != own: continue
+        if full in seen: continue
+        seen.add(full); pages.append(full)
+    text = ''
+    with cf.ThreadPoolExecutor(max_workers=6) as ex:
+        for _, r in ex.map(fetch, pages[:8]):
+            if not r: continue
+            t = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
+                re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', r))))
+            text += t[:4000] + '\n'
+    if len(text) < 200: return [], 0.0
+    prompt = (f'Below is text from the website of "{venue}" ({pc}), a venue that hires its halls and pitches '
+              f'to outside groups. List ONLY the outside organisations named as using, hiring or running '
+              f'activities at this venue: community groups, clubs, classes, faith and cultural groups, '
+              f'supplementary schools. Exclude the venue itself, its departments, staff, its own curriculum '
+              f'or after-school provision, suppliers, other schools, and anything not clearly a named group.\n'
+              f'Return ONLY a JSON array of objects: [{{"name":"<organisation>","note":"<what they do here>"}}]\n\n'
+              + text[:24000])
+    body = json.dumps({"model": "gpt-4o", "temperature": 0, "max_tokens": 1200,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    try:
+        r = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body,
+            headers={"Authorization": "Bearer " + OPENAI_KEY, "Content-Type": "application/json"})
+        d = json.load(urllib.request.urlopen(r, timeout=120))
+        u = d.get('usage', {})
+        cost = round(u.get('prompt_tokens', 0) / 1e6 * 2.50 + u.get('completion_tokens', 0) / 1e6 * 10.0, 4)
+        arr = json.loads(re.search(r'\[[\s\S]*\]', d['choices'][0]['message']['content']).group(0))
+    except Exception as e:
+        sys.stderr.write(f"own-site err {e}\n"); return [], 0.0
+    out, seen_n = [], set()
+    for it in arr:
+        nm = (it.get('name') or '').strip() if isinstance(it, dict) else ''
+        if not nm or is_junk(nm) or collapse(nm) in collapse(venue) or collapse(venue) in collapse(nm): continue
+        k = collapse(nm)[:20]
+        if not k or k in seen_n: continue
+        seen_n.add(k)
+        out.append({'name': nm, 'domain': '', 'tie': 'venue', 'url': root,
+                    'snippet': (it.get('note') or '')[:280],
+                    'evidence': f"Named on {venue}'s own website as a hirer. {(it.get('note') or '')}".strip()[:1200],
+                    'src': 'venue_site'})
+    return out, cost
+
+def classforkids(venue, pc):
+    """ClassForKids lists activity providers by venue. The postcode slug pins it to the right place,
+    which is what makes this directory usable where the others are geographically vague."""
+    slug = collapse(pc)
+    slug = f"{slug[:-3]}-{slug[-3:]}" if len(slug) >= 5 else slug
+    try:
+        _, raw = fetch(f"https://classforkids.io/en-GB/classes/{slug}")
+    except Exception:
+        return []
+    out, seen = [], set()
+    for m in re.finditer(r'https?://([a-z0-9\-]+)\.classforkids\.io[^"\']*?venueName=([^"\'&]+)', raw or '', re.I):
+        provider, venue_name = m.group(1), urllib.parse.unquote_plus(m.group(2))
+        if collapse(venue)[:14] not in collapse(venue_name): continue
+        nm = provider.replace('-', ' ').title()
+        k = collapse(nm)[:20]
+        if not k or k in seen or is_junk(nm): continue
+        seen.add(k)
+        out.append({'name': nm, 'domain': f'{provider}.classforkids.io', 'tie': 'venue',
+                    'url': f'https://{provider}.classforkids.io', 'snippet': f'Classes at {venue_name}',
+                    'evidence': f'Listed on ClassForKids as running classes at {venue_name}.', 'src': 'dataforseo'})
+    return out
+
+def fb_pages(venue, pc):
+    """Pages whose own details name the venue — a standing group, where a post is a single occurrence."""
+    if not APIFY: return []
+    u = f"https://api.apify.com/v2/acts/apify~facebook-search-scraper/run-sync-get-dataset-items?clean=true&token={APIFY}"
+    body = json.dumps({"query": f"{venue} {pc}", "search_type": "pages", "max_results": 12}).encode()
+    try:
+        rows = json.load(urllib.request.urlopen(urllib.request.Request(u, data=body, headers={"Content-Type": "application/json"}), timeout=180))
+    except Exception as e:
+        sys.stderr.write(f"fb pages err {e}\n"); return []
+    vcol, pcol = collapse(venue), collapse(pc)
+    out, seen = [], set()
+    for p in rows if isinstance(rows, list) else []:
+        if not isinstance(p, dict): continue
+        nm = p.get('name') or p.get('title') or ''
+        blob = collapse(json.dumps(p))
+        if not nm or not (pcol in blob or (len(vcol) > 6 and vcol in blob)): continue
+        k = collapse(nm)[:20]
+        if not k or k in seen or is_junk(nm): continue
+        seen.add(k)
+        out.append({'name': nm, 'domain': 'facebook', 'tie': 'venue', 'url': p.get('url') or p.get('pageUrl') or '',
+                    'snippet': (p.get('intro') or p.get('description') or '')[:280],
+                    'evidence': (p.get('intro') or p.get('description') or '')[:1200],
+                    'email': p.get('email'), 'phone': p.get('phone'),
+                    'image': fb_image(p), 'src': 'facebook'})
     return out
 
 def fb_image(p):
@@ -703,11 +848,17 @@ def run(sid):
         sreq("POST", "rpc/copy_venue_search_results", {"p_from": prior, "p_to": sid})
         set_status(sid, 'complete'); print(f"  cache hit from {prior} — £0"); return
     web, dfs_cost = discover_web(venue, pc, own)
+    t_own = time.time()
+    site, site_cost = venue_own_site(venue, pc, own)
+    print(f"  venue site: {len(site)} named hirers in {time.time()-t_own:.0f}s")
     db = db_postcode(pc)
     t_fb = time.time()
-    fb = fb_posts(venue, pc)
-    print(f"  facebook: {len(fb)} authors in {time.time()-t_fb:.0f}s")
-    cands = web + db + fb
+    fb = fb_posts(venue, pc) + fb_pages(venue, pc)
+    print(f"  facebook: {len(fb)} authors/pages in {time.time()-t_fb:.0f}s")
+    t_cfk = time.time()
+    cfk = classforkids(venue, pc)
+    print(f"  classforkids: {len(cfk)} providers in {time.time()-t_cfk:.0f}s")
+    cands = web + site + db + fb + cfk
     print(f"  candidates: web={len(web)} db={len(db)} fb={len(fb)} | gate={'gpt-4o' if OPENAI_KEY else 'DETERMINISTIC(no key)'}")
     verdicts, gate_cost = gate(cands, venue, pc)
     survivors, stale = [], 0
@@ -721,6 +872,9 @@ def run(sid):
         c['tier'] = conf or ('confirmed' if c['tie'] == 'postcode' else 'likely'); c['category'] = cat
         survivors.append(c)
     if stale: print(f"  dropped {stale} with evidence over a year old")
+    before = len(survivors)
+    survivors = merge_duplicates(survivors)
+    if before != len(survivors): print(f"  merged {before - len(survivors)} duplicate listings")
     t_c = time.time()
     pages = fill_contacts(survivors)
     print(f"  contacts: {pages} pages in {time.time()-t_c:.0f}s")
@@ -728,7 +882,7 @@ def run(sid):
     apify_cost = 0.05 if fb else 0.0
     g_calls = 1 if GPLACES else 0
     g_cost = round(0.032 * g_calls, 4)  # Places Text Search
-    total = round(dfs_cost + gate_cost + apify_cost + g_cost, 4)
+    total = round(dfs_cost + gate_cost + apify_cost + g_cost + site_cost, 4)
     with_contact = sum(1 for k in kept if k.get('email') or k.get('phone_number'))
     print(f"  kept {len(kept)} of {len(cands)} | {with_contact} with a contact")
     print(f"  SPEND: dataforseo=${dfs_cost} gate=${gate_cost} apify=${apify_cost} places=${g_cost} | total=${total}")
@@ -737,21 +891,11 @@ def run(sid):
         "p_search_id": sid, "p_results": kept,
         "p_cost_google": g_cost, "p_cost_dataforseo": dfs_cost, "p_cost_apify": apify_cost,
         "p_google_calls": g_calls})
-    # shared enrichment (still n8n): promotes staged rows -> vivify_organisations + contact details + links + cleanup trigger
-    try:
-        urllib.request.urlopen(urllib.request.Request(
-            "https://operosus.app.n8n.cloud/webhook/vivify-group-enrich",
-            data=json.dumps({"search_id": sid}).encode(),
-            headers={"Content-Type": "application/json"}), timeout=30)
-        print("  enrichment triggered — n8n marks it complete when it finishes")
-        return
-    except Exception as e:
-        sys.stderr.write(f"enrich trigger err {e}\n")
-    # Only finish the search ourselves if enrichment could not be started, so the UI never hangs.
-    # Otherwise n8n sets 'complete' when it is genuinely done, and the cleanup trigger fires AFTER
-    # enrichment has written its contacts — which is the only point at which validating them works.
-    set_status(sid, 'complete')
-    print(f"  done — status complete (enrichment not running)")
+    # Promote straight to the organisation table ourselves. The shared n8n enrichment used to do this,
+    # but it re-scraped every site and wrote contacts this worker had already rejected, and it took
+    # minutes. Everything written here has been validated, and the cleanup trigger fires on 'complete'.
+    res = sreq("POST", "rpc/promote_venue_results", {"p_search_id": sid})
+    print(f"  promoted {res.get('promoted') if isinstance(res, dict) else res} organisations — status complete")
 
 if __name__ == '__main__':
     run(int(sys.argv[1]))
