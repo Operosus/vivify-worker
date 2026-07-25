@@ -81,8 +81,34 @@ SUPPLEMENTARY = re.compile(r'\b(tamil|persian|farsi|german|french|spanish|polish
 def mainstream_school(n):
     return bool(re.search(r'\b(school|academy|college)\b', n, re.I)) and not SUPPLEMENTARY.search(n)
 
+# Facebook authors are often just people ("Wendy Chalmers"), not the group hiring the hall. A person's
+# name is only a lead if they are visibly trading, which shows up as an organisation word in the name.
+FIRST_NAMES = {
+ 'anna','eliza','wendy','sarah','claire','clare','emma','laura','lisa','karen','joanne','joanna','helen','julie',
+ 'rachel','rebecca','becky','hannah','kate','katie','katherine','catherine','elizabeth','charlotte','sophie','amy',
+ 'jessica','jess','lucy','olivia','emily','ellie','holly','megan','natalie','nicola','michelle','melanie','donna',
+ 'tracy','tracey','sharon','susan','sue','jane','janet','angela','angie','amanda','mandy','deborah','debbie','gemma',
+ 'jenny','jennifer','louise','lauren','leanne','kelly','stacey','danielle','chloe','abbie','abigail','georgia','grace',
+ 'john','david','dave','michael','mike','james','jim','paul','peter','pete','andrew','andy','mark','stephen','steven',
+ 'steve','chris','christopher','daniel','dan','matthew','matt','richard','rich','robert','rob','thomas','tom','anthony',
+ 'tony','gary','simon','martin','ian','alan','kevin','keith','neil','graham','philip','phil','adam','ben','benjamin',
+ 'jack','jake','josh','joshua','luke','ryan','sam','samuel','scott','sean','shaun','stuart','craig','carl','wayne',
+ 'darren','dean','glenn','lee','liam','nathan','oliver','owen','ross','shane','terry','trevor','vincent','warren',
+ 'aisha','fatima','mohammed','muhammad','ahmed','ali','omar','hassan','priya','raj','anita','sanjay','laural','shaz'}
+ORG_WORDS = re.compile(r'\b(club|fc|afc|utd|united|academy|school|college|church|chapel|centre|center|studio|'
+    r'society|association|assoc|group|trust|foundation|ltd|limited|cic|c\.i\.c|charity|team|league|coaching|'
+    r'coach|classes|class|lessons|tuition|dance|arts|theatre|gym|gymnastics|martial|karate|judo|fitness|yoga|'
+    r'pilates|scouts|guides|brownies|cubs|nursery|preschool|playgroup|toddler|kickers|tots|stars|sports|athletic|'
+    r'cricket|netball|football|basketball|rugby|hockey|tennis|badminton|swim|music|choir|band|orchestra|drama)\b', re.I)
+def personal_name(n):
+    w = [x for x in re.split(r'\s+', (n or '').strip()) if x]
+    if not (2 <= len(w) <= 3) or ORG_WORDS.search(n): return False
+    if not all(re.fullmatch(r"[A-Za-z'’\-]+", x) for x in w): return False
+    return w[0].lower() in FIRST_NAMES
+
 def is_junk(name):
     n = (name or '').strip()
+    if personal_name(n): return True
     if len(n) < 3 or not re.search(r'[a-z]', n, re.I): return True
     if n.lower() in BARE_ACTIVITY: return True
     if mainstream_school(n): return True
@@ -717,11 +743,15 @@ def run(sid):
             "https://operosus.app.n8n.cloud/webhook/vivify-group-enrich",
             data=json.dumps({"search_id": sid}).encode(),
             headers={"Content-Type": "application/json"}), timeout=30)
-        print("  enrichment triggered")
+        print("  enrichment triggered — n8n marks it complete when it finishes")
+        return
     except Exception as e:
         sys.stderr.write(f"enrich trigger err {e}\n")
+    # Only finish the search ourselves if enrichment could not be started, so the UI never hangs.
+    # Otherwise n8n sets 'complete' when it is genuinely done, and the cleanup trigger fires AFTER
+    # enrichment has written its contacts — which is the only point at which validating them works.
     set_status(sid, 'complete')
-    print(f"  done — status complete")
+    print(f"  done — status complete (enrichment not running)")
 
 if __name__ == '__main__':
     run(int(sys.argv[1]))
