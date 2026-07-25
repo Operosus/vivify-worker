@@ -41,7 +41,7 @@ NOISE = ['wikipedia.org','indeed.','reed.co.uk','totaljobs','glassdoor','tes.com
     'rome2rio','bustimes','londonbusroutes','tfl.gov.uk','gettyimages','wikimapia','upmystreet','edarabia','applicaaone',
     'cylex','daynurseries','moovit','mapcarta','localeiq','propertistics','streetlist','streetcheck','doogal',
     'housepriceinflation','rentaroof','sharetobuy','bellway','data.parliament','wikimedia','rocketreach','flower-shops',
-    'nhs.uk','heyschools','heygolf','schoolratings','schoolsfootball','schoolsnetball','schoolsbasketball',
+    'netmums','trip.com','klook','viator','timeout.com','nhs.uk','heyschools','heygolf','schoolratings','schoolsfootball','schoolsnetball','schoolsbasketball',
     'allschools','schoolstogether','schoolowl','goodschools','locatethis','cleanair','primarytimes']
 AGG = ['charitycommission','findachurch','classforkids','pitchfinder','clubspark','playfootball','happity',
        'footyaddicts','hoop.co.uk','eventbrite','meetup']
@@ -57,7 +57,8 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'^welcome', r'^gallery$', r'^our (classes|clubs|facilities)', r'mathsconf', r'business studies',
     r'exams? assistant', r'football pitch', r'auditorium|drama studio|gymnasium|sports hall', r'pitches? - ',
     r'match overview', r'\bvs\.? ', r'booking system', r'events calendar', r'girls pe ', r'^event:',
-    r'^results?$', r'^news$', r'leggings', r'^\d', r'^map of', r'^area information', r'postcode s']]
+    r'^results?$', r'^news$', r'leggings', r'^\d', r'^map of', r'^area information', r'postcode s',
+    r"^(baby|toddler|kids|children'?s) .* classes", r'^classes (in|near)', r'^things to do']]
 def is_junk(name):
     n = (name or '').strip()
     if len(n) < 3 or not re.search(r'[a-z]', n, re.I): return True
@@ -391,6 +392,11 @@ def discover_web(venue, pc, own=''):
                     'email': d.get('email'), 'phone': d.get('phone'), 'src': 'dataforseo'})
     for r in agg:
         if is_junk(r['name']) or collapse(r['name']) in vcol or vcol in collapse(r['name']): continue
+        # On a directory page the hirer is the org LISTED, never the directory — drop Footyaddicts,
+        # Netmums and friends when the extracted name is just the platform's own brand.
+        aggbrand = collapse(_registrable(r['domain']).split('.')[0])
+        nm = collapse(r['name'])
+        if aggbrand and (aggbrand in nm or nm in aggbrand): continue
         k = collapse(r['name'])[:20]
         if k in seen_n: continue
         seen_n.add(k); r['src'] = 'dataforseo'; out.append(r)
@@ -460,6 +466,11 @@ def gate(cands, venue, pc):
         f'venue ("{venue}") or postcode {pc} as where it runs/plays/meets — not a different venue or just the wider area. '
         f'useful=false for: the venue itself/its pages/staff, jobs, news/Ofsted, directions/maps/transport, aggregator '
         f'index pages, estate agents/area guides, unrelated businesses, bare personal names. '
+        f'The hirer is whoever RUNS the session, never the website that merely lists somebody else\'s: if the candidate '
+        f'is a directory, listings site, ticketing platform or publisher advertising other people\'s classes (Netmums, '
+        f'Happity, Footyaddicts, Eventbrite, Trip.com, ClassForKids, Meetup and the like), useful=false even when the '
+        f'listing names this venue. An operator that runs its OWN leagues, classes or camps at the venue IS a hirer, '
+        f'even if it also sells places online. '
         f'confidence="confirmed" if it explicitly names this venue or postcode, else "likely". When in doubt useful=false.\n'
         f'Return ONLY a JSON array: [{{"i":<index>,"useful":true|false,"confidence":"confirmed"|"likely","category":"<short>"}}]\n\n'
         + items)
