@@ -59,9 +59,14 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'match overview', r'\bvs\.? ', r'booking system', r'events calendar', r'girls pe ', r'^event:',
     r'^results?$', r'^news$', r'leggings', r'^\d', r'^map of', r'^area information', r'postcode s',
     r"^(baby|toddler|kids|children'?s) .* classes", r'^classes (in|near)', r'^things to do']]
+# A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
+BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
+                 'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
+                 'holiday camps','football training','sports','fitness','swimming','athletics','rugby','hockey'}
 def is_junk(name):
     n = (name or '').strip()
     if len(n) < 3 or not re.search(r'[a-z]', n, re.I): return True
+    if n.lower() in BARE_ACTIVITY: return True
     if any(r.search(n) for r in JUNK_RE): return True
     w = n.split(); caps = sum(1 for x in w if x[:1].isupper() or x[:1].isdigit())
     return len(w) >= 6 and caps <= 1
@@ -179,6 +184,8 @@ EMAIL_BADDOM = ('sentry', 'wixpress', 'example.', 'schema.org', 'w3.org', 'googl
                 'jquery', 'bootstrap', 'fontawesome', '.min.', 'domain.com', 'email.com', 'yourdomain', 'sentry.io', 'gov.uk')
 EMAIL_RE = re.compile(r'[a-z0-9][a-z0-9._%+\-]*@[a-z0-9.\-]+\.[a-z]{2,}', re.I)
 PHONE_RE = re.compile(r'(?:\+44\s?|\b0)(?:\d[\d\s().\-]{7,12}\d)')
+FREEMAIL = {'gmail.com','googlemail.com','hotmail.com','hotmail.co.uk','outlook.com','yahoo.com','yahoo.co.uk',
+            'btinternet.com','live.co.uk','icloud.com','me.com','aol.com','sky.com','virginmedia.com'}
 PREF_LOCAL = ('info', 'hello', 'contact', 'enquiries', 'enquiry', 'admin', 'office', 'hi', 'team', 'bookings', 'reception')
 PLACEHOLDER_PHONES = {'01234567890', '02012345678', '07123456789', '00000000000', '01111111111', '07000000000', '07700900000'}
 
@@ -219,8 +226,12 @@ def contacts(raw, org_domain):
     if cands:
         org_reg = _registrable(org_domain)
         own = [e for e in cands if _registrable(e.split('@')[1]) == org_reg]
-        pref = [e for e in cands if e.split('@')[0] in PREF_LOCAL]
-        email = (own and (next((e for e in own if e.split('@')[0] in PREF_LOCAL), own[0]))) or (pref[0] if pref else cands[0])
+        # A page often lists OTHER organisations' addresses (a surgery listing local groups, a directory
+        # entry). Only the org's own domain or a free mailbox on its own site can be trusted as its contact.
+        free = [e for e in cands if _registrable(e.split('@')[1]) in FREEMAIL]
+        pool = own or free
+        pref = [e for e in pool if e.split('@')[0] in PREF_LOCAL]
+        email = (pref[0] if pref else (pool[0] if pool else None))
     # phone (UK) — tel: links first, then anything phone-shaped in the text
     phone = None
     tel = [re.sub(r'[^\d+]', '', m) for m in re.findall(r'(?i)href=["\']tel:([^"\'>]+)', text)]
