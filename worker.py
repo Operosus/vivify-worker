@@ -158,13 +158,42 @@ def page_blob(raw, snippet, title):
     return collapse(title + ' ' + snippet + ' ' + html.unescape(re.sub(r'(?is)<[^>]+>', ' ', raw)))
 
 def page_evidence(raw, venue, pc):
-    """Return a short human evidence sentence around the venue/postcode mention."""
-    text = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ', re.sub(r'(?is)<(script|style)[^>]*>.*?</\1>', ' ', raw))))
+    """The passage around the venue mention. Vivify reads this before ringing a club, so give them
+    enough to judge it (day, time, activity), not a clipped fragment."""
+    text = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ', re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw))))
     low = text.lower()
     for needle in [pc.lower(), venue.lower().split(',')[0][:18]]:
         i = low.find(needle)
-        if i >= 0: return text[max(0, i-70):i+90].strip()
+        if i >= 0:
+            s, e = max(0, i - 600), min(len(text), i + 900)
+            out = text[s:e].strip()
+            return ('...' if s > 0 else '') + out + ('...' if e < len(text) else '')
     return ''
+
+DATE_META = [r'(?is)<meta[^>]+property=["\']article:(?:published|modified)_time["\'][^>]+content=["\']([^"\']+)',
+             r'(?is)<meta[^>]+itemprop=["\']date(?:Published|Modified)["\'][^>]+content=["\']([^"\']+)',
+             r'(?is)"date(?:Published|Modified)"\s*:\s*"([^"]+)"',
+             r'(?is)<time[^>]+datetime=["\']([^"\']+)']
+def page_date(raw):
+    """When the page says it was published — an old fixture list is a weaker lead than a live timetable."""
+    for pat in DATE_META:
+        m = re.search(pat, raw or '')
+        if m:
+            d = m.group(1).strip()
+            if re.match(r'^\d{4}-\d{2}-\d{2}', d): return d[:10]
+    return None
+
+def og_image(raw, base):
+    """The page's own share image — the closest thing to a screenshot we can capture without a browser."""
+    for pat in [r'(?is)<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                r'(?is)<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)']:
+        m = re.search(pat, raw or '')
+        if m:
+            u = html.unescape(m.group(1)).strip()
+            if u.startswith('//'): u = 'https:' + u
+            elif u.startswith('/'): u = urllib.parse.urljoin(base, u)
+            if u.startswith('http'): return u[:500]
+    return None
 
 def site_name(raw):
     """The site's own brand name from og:site_name / <title> tail — far cleaner than a SERP page title."""
@@ -325,6 +354,7 @@ def discover_web(venue, pc, own=''):
         rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
         if tie:
             rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc)
+            rec['evidence_date'] = page_date(raw); rec['image'] = og_image(raw, c['url'])
             # own site OR a charity/church register page (those list the org's own contact) — not class/sport directories
             if not is_agg(c['domain']) or 'charitycommission' in c['domain'] or 'findachurch' in c['domain']:
                 rec['email'], rec['phone'] = contacts(raw, c['domain'])
@@ -345,10 +375,12 @@ def discover_web(venue, pc, own=''):
         if is_agg(r['domain']):
             agg.append({'name': brand([r['title']], r['domain']), 'domain': r['domain'], 'tie': r['tie'],
                         'url': r['url'], 'snippet': r['snippet'], 'evidence': r.get('evidence', ''),
+                        'evidence_date': r.get('evidence_date'), 'image': r.get('image'),
                         'email': r.get('email'), 'phone': r.get('phone')})
         else:
             d = byd.setdefault(r['domain'], {'titles': [], 'tie': r['tie'], 'url': r['url'],
                                              'snippet': r['snippet'], 'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', ''),
+                                             'evidence_date': r.get('evidence_date'), 'image': r.get('image'),
                                              'email': r.get('email'), 'phone': r.get('phone'), 'clinks': r.get('clinks', [])})
             d['titles'].append(r['title'])
             if not d.get('sitename'): d['sitename'] = r.get('sitename', '')
@@ -368,13 +400,15 @@ def discover_web(venue, pc, own=''):
         tie = tie_kind(page_blob(raw, '', title), *vmeta)
         if not tie: return (dom, title, su, None, '', '', None, None)
         em, ph = contacts(raw, dom)
-        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph)
+        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph,
+                page_date(raw), og_image(raw, su))
     t2 = time.time()
     if targets:
         with cf.ThreadPoolExecutor(max_workers=8) as ex:
-            for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
+            for dom, title, su, tie, sname, ev, em, ph, edate, img in ex.map(process_sub, targets):
                 if tie and dom not in byd:
-                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
+                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname,
+                                'evidence': ev, 'evidence_date': edate, 'image': img, 'email': em, 'phone': ph}
     print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
     out, seen_n = [], set()
     for dom, d in byd.items():
@@ -385,6 +419,7 @@ def discover_web(venue, pc, own=''):
         seen_n.add(k)
         out.append({'name': nm, 'domain': dom, 'tie': d['tie'], 'url': d['url'],
                     'snippet': d.get('snippet', ''), 'evidence': d.get('evidence', ''),
+                    'evidence_date': d.get('evidence_date'), 'image': d.get('image'),
                     'email': d.get('email'), 'phone': d.get('phone'), 'clinks': d.get('clinks', []),
                     'src': 'dataforseo'})
     for r in agg:
@@ -439,6 +474,24 @@ def db_postcode(pc):
                     'email': r.get('email'), 'phone': r.get('phone_number')})
     return out
 
+def fb_image(p):
+    """The post's own photo. Actors vary in shape, so look everywhere it might be."""
+    for k in ('image', 'imageUrl', 'thumbnailUrl', 'photo', 'picture', 'full_picture'):
+        v = p.get(k)
+        if isinstance(v, str) and v.startswith('http'): return v[:500]
+        if isinstance(v, dict):
+            u = v.get('uri') or v.get('url')
+            if isinstance(u, str) and u.startswith('http'): return u[:500]
+    for k in ('images', 'photos', 'attachments', 'media'):
+        v = p.get(k)
+        if isinstance(v, list) and v:
+            first = v[0]
+            if isinstance(first, str) and first.startswith('http'): return first[:500]
+            if isinstance(first, dict):
+                u = first.get('url') or first.get('uri') or first.get('src') or first.get('image')
+                if isinstance(u, str) and u.startswith('http'): return u[:500]
+    return None
+
 def fb_posts(venue, pc):
     if not APIFY: return []
     u = f"https://api.apify.com/v2/acts/powerai~facebook-post-search-scraper/run-sync-get-dataset-items?clean=true&token={APIFY}"
@@ -465,7 +518,8 @@ def fb_posts(venue, pc):
             elif isinstance(ts, str) and ts: evdate = ts
         except Exception: evdate = None
         out.append({'name': nm, 'domain': 'facebook', 'tie': 'venue', 'url': a.get('url') or '',
-                    'snippet': msg[:280], 'evidence': msg[:200], 'evidence_date': evdate, 'src': 'facebook_post'})
+                    'snippet': msg[:280], 'evidence': msg[:2000],  # the whole post, not a clipped fragment
+                    'evidence_date': evdate, 'image': fb_image(p), 'src': 'facebook_post'})
     return out
 
 # ---------------- LLM gate ----------------
@@ -552,6 +606,13 @@ def cache_lookup(venue, pc, sid):
     return rows[0]['id'] if rows else None
 
 # ---------------- main ----------------
+def shot(url, src):
+    """Fallback proof image: a live screenshot of the evidence page, rendered on demand by thum.io.
+    Plenty of small club sites publish no share image, and Vivify wants to SEE the page that names
+    the venue. No browser on this worker and no cost; swap the base URL if the service ever changes."""
+    if src != 'dataforseo' or not url or not url.startswith('http'): return None
+    return f"https://image.thum.io/get/width/900/crop/700/{url}"
+
 def to_result(c):
     name = c['name']
     pid = c.get('place_id') or (synth('vdb', str(c['db_id'])) if c.get('db_id') else synth(c['src'][:3], (c.get('url') or '') + '|' + (c.get('domain') or name)))
@@ -563,7 +624,8 @@ def to_result(c):
         "activity_description": c.get('snippet') or None, "additional_information": c.get('url') or None,
         "activity_type": c.get('category') or None, "place_id": pid,
         "evidence_source": c['src'], "evidence_url": c.get('url') or None, "source_url": c.get('url') or None,
-        "evidence_text": c.get('evidence') or c.get('snippet') or None, "evidence_image_url": None,
+        "evidence_text": c.get('evidence') or c.get('snippet') or None,
+        "evidence_image_url": c.get('image') or shot(c.get('url'), c['src']),
         "evidence_date": c.get('evidence_date'), "confidence_tier": c['tier'],
     }
 
