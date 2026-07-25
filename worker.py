@@ -64,15 +64,28 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'^u\d{1,2}\b', r'^(under|year) \d', r'^\w+ (schools?|clubs?|classes) in ', r'training$', r'^(junior|senior|adult)s? ',
     r'^(winter|summer|spring|autumn) ', r'^(half.term|holiday) ', r'^book ', r'^join ', r'^register ',
     r'showcase$', r'\bshowcase\b', r'open day', r'presentation (evening|night)', r'fun day', r'taster session',
-    r'(christmas|easter|summer) (show|fair|fayre|party)']]
+    r'(christmas|easter|summer) (show|fair|fayre|party)',
+    # another mainstream school is a venue, not a hirer (supplementary/faith schools don't use these words)
+    r'\b(high school|primary school|infant school|junior school|grammar school|voluntary academy|academy trust|sixth form)\b']]
 # A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
 BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
                  'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
                  'holiday camps','football training','sports','fitness','swimming','athletics','rugby','hockey'}
+# A supplementary, faith or activity school hires halls; a mainstream school is somebody else's venue.
+# These tokens are what tells the two apart, since both are "... School".
+SUPPLEMENTARY = re.compile(r'\b(tamil|persian|farsi|german|french|spanish|polish|greek|chinese|mandarin|arabic|'
+    r'urdu|somali|turkish|russian|japanese|korean|saturday|sunday|supplementary|madrasah|madrasa|quran|islamic|'
+    r'hebrew|torah|sikh|hindu|church|christian|catholic mission|dance|ballet|drama|stage|theatre|performing|'
+    r'music|singing|maths|tuition|tutor|language|driving|swim|football|martial|karate|judo|gymnastic|circus|'
+    r'forest|montessori|nursery|preschool|pre-school|holiday|coding|chess|art)\b', re.I)
+def mainstream_school(n):
+    return bool(re.search(r'\b(school|academy|college)\b', n, re.I)) and not SUPPLEMENTARY.search(n)
+
 def is_junk(name):
     n = (name or '').strip()
     if len(n) < 3 or not re.search(r'[a-z]', n, re.I): return True
     if n.lower() in BARE_ACTIVITY: return True
+    if mainstream_school(n): return True
     if any(r.search(n) for r in JUNK_RE): return True
     w = n.split(); caps = sum(1 for x in w if x[:1].isupper() or x[:1].isdigit())
     return len(w) >= 6 and caps <= 1
@@ -116,6 +129,11 @@ def resolve_venue(venue, pc):
         if cand and score(cand) > 0: best = cand; break
     if not best: return venue, pc, ''
     name = ((best.get('displayName') or {}).get('text') or venue).strip()
+    # Never downgrade to a vaguer name. Google lists Harrytown Catholic High School as plain "Harrytown"
+    # (the road), and searching for "Harrytown" drags in every other school that mentions the street.
+    # Upgrades are fine and are the whole point ("St John's Wood" -> "Harris Academy St John's Wood").
+    if collapse(name) and collapse(name) in collapse(venue) and len(name) < len(venue):
+        name = venue
     m = UKPC_RE.search(best.get('formattedAddress') or '')
     newpc = f"{m.group(1)} {m.group(2)}".upper() if m else pc
     if pc and collapse(newpc)[:len(oc)] != oc: newpc = pc  # different outcode = wrong place, keep what was typed
@@ -497,7 +515,9 @@ def fb_image(p):
 def fb_posts(venue, pc):
     if not APIFY: return []
     u = f"https://api.apify.com/v2/acts/powerai~facebook-post-search-scraper/run-sync-get-dataset-items?clean=true&token={APIFY}"
-    body = json.dumps({"query": venue, "maxResults": 15, "recent_posts": True, "start_date": "2025-06-26"}).encode()
+    # Vivify chase current hirers: a post from two years ago is not proof anyone still books the hall.
+    since = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 183 * 86400))
+    body = json.dumps({"query": venue, "maxResults": 15, "recent_posts": True, "start_date": since}).encode()
     try:
         rows = json.load(urllib.request.urlopen(urllib.request.Request(u, data=body, headers={"Content-Type": "application/json"}), timeout=180))
     except Exception as e:
@@ -659,11 +679,17 @@ def run(sid):
     cands = web + db + fb
     print(f"  candidates: web={len(web)} db={len(db)} fb={len(fb)} | gate={'gpt-4o' if OPENAI_KEY else 'DETERMINISTIC(no key)'}")
     verdicts, gate_cost = gate(cands, venue, pc)
-    survivors = []
+    survivors, stale = [], 0
+    cutoff = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 365 * 86400))
     for c, (ok, conf, cat) in zip(cands, verdicts):
         if not ok: continue
+        # A page that dates itself more than a year back is a stale listing, not a live booking.
+        # Undated pages stay: most small club sites publish no date at all.
+        ed = (c.get('evidence_date') or '')[:10]
+        if ed and ed < cutoff: stale += 1; continue
         c['tier'] = conf or ('confirmed' if c['tie'] == 'postcode' else 'likely'); c['category'] = cat
         survivors.append(c)
+    if stale: print(f"  dropped {stale} with evidence over a year old")
     t_c = time.time()
     pages = fill_contacts(survivors)
     print(f"  contacts: {pages} pages in {time.time()-t_c:.0f}s")
