@@ -418,7 +418,7 @@ def discover_web(venue, pc, own=''):
         dom, title, su = t
         _, raw = fetch(su)
         tie = tie_kind(page_blob(raw, '', title), *vmeta)
-        if not tie: return (dom, title, su, None, '', '', None, None)
+        if not tie: return (dom, title, su, None, '', '', None, None, None, None)
         em, ph = contacts(raw, dom)
         return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph,
                 page_date(raw), og_image(raw, su))
