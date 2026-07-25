@@ -527,6 +527,7 @@ def run(sid):
     print(f"[{sid}] {venue} ({pc})")
     set_status(sid, 'searching')
     cname, cpc, own = resolve_venue(venue, pc)
+    print(f"  places={'on' if GPLACES else 'OFF'} resolved={cname!r} {cpc!r} own={own!r}")
     if (cname, cpc) != (venue, pc):
         print(f"  canonical: {cname} ({cpc}){' own site ' + own if own else ''}")
         # write it back so the results, the cache key and monitoring all use the canonical venue
