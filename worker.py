@@ -284,9 +284,12 @@ def discover_web(venue, pc, own=''):
     vcol, pcol, vtoks, oc = collapse(venue), collapse(pc), vtokens(venue), outcode(pc)
     ownreg = _registrable(own) if own else ''
     raw, seen, cost = [], set(), 0.0
+    t0 = time.time()
     qs = queries_for(venue, pc, own)
-    with cf.ThreadPoolExecutor(max_workers=8) as ex:  # ~45 queries; sequential made a search take 20 minutes
+    # 4 at a time: DataForSEO throttles heavier parallelism, and a throttled query still costs on retry
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
         answers = list(ex.map(dfs, qs))
+    print(f"  serp: {len(qs)} queries in {time.time()-t0:.0f}s")
     for items, qcost in answers:
         cost += qcost
         for r in items:
@@ -314,8 +317,10 @@ def discover_web(venue, pc, own=''):
         else:
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
         return rec  # raw HTML dropped here
+    t1 = time.time()
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         results = list(ex.map(process_main, cands))
+    print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
     byd, agg = {}, []
     for r in results:
         if not r['tie']: continue
@@ -346,11 +351,14 @@ def discover_web(venue, pc, own=''):
         if not tie: return (dom, title, su, None, '', '', None, None)
         em, ph = contacts(raw, dom)
         return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph)
+    t2 = time.time()
     if targets:
         with cf.ThreadPoolExecutor(max_workers=16) as ex:
             for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
+    print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
+    t3 = time.time()
     # Contact backfill: orgs that tied but exposed no contact yet — read every plausible contact page.
     # Contact coverage is the whole point of a lead (a name with no way to reach them is not actionable),
     # so this goes wider than the one linked page it used to try: all contact-ish links, then the
@@ -370,6 +378,7 @@ def discover_web(venue, pc, own=''):
             for dom, em, ph in ex.map(get_contact, backfill):
                 if em and not byd[dom].get('email'): byd[dom]['email'] = em
                 if ph and not byd[dom].get('phone'): byd[dom]['phone'] = ph
+    print(f"  contacts: {len(backfill)} pages in {time.time()-t3:.0f}s")
     out, seen_n = [], set()
     for dom, d in byd.items():
         nm = d.get('sitename') or brand(d['titles'], dom)
@@ -547,7 +556,9 @@ def run(sid):
         set_status(sid, 'complete'); print(f"  cache hit from {prior} — £0"); return
     web, dfs_cost = discover_web(venue, pc, own)
     db = db_postcode(pc)
+    t_fb = time.time()
     fb = fb_posts(venue, pc)
+    print(f"  facebook: {len(fb)} authors in {time.time()-t_fb:.0f}s")
     cands = web + db + fb
     print(f"  candidates: web={len(web)} db={len(db)} fb={len(fb)} | gate={'gpt-4o' if OPENAI_KEY else 'DETERMINISTIC(no key)'}")
     verdicts, gate_cost = gate(cands, venue, pc)
