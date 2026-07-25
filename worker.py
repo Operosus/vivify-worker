@@ -20,6 +20,7 @@ DFS_AUTH = base64.b64encode(f"{ENV['DATAFORSEO_LOGIN']}:{ENV['DATAFORSEO_PASSWOR
 SUPA, SKEY = ENV['SUPABASE_URL'], ENV['SUPABASE_KEY']
 APIFY = ENV.get('APIFY_TOKEN', '')
 OPENAI_KEY = ENV.get('OPENAI_API_KEY', '') or os.environ.get('OPENAI_API_KEY', '')
+GPLACES = ENV.get('GOOGLE_PLACES_KEY', '')
 import functools
 print = functools.partial(print, flush=True)
 
@@ -64,6 +65,51 @@ def is_junk(name):
     w = n.split(); caps = sum(1 for x in w if x[:1].isupper() or x[:1].isdigit())
     return len(w) >= 6 and caps <= 1
 
+UKPC_RE = re.compile(r'\b([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\b', re.I)
+GOOD_TYPES = ('school', 'primary_school', 'secondary_school', 'university', 'church', 'place_of_worship',
+              'stadium', 'gym', 'community_center', 'establishment', 'point_of_interest')
+AREA_TYPES = ('locality', 'sublocality', 'sublocality_level_1', 'neighborhood', 'postal_code', 'postal_town',
+              'political', 'route', 'administrative_area_level_1', 'administrative_area_level_2')
+
+def resolve_venue(venue, pc):
+    """Canonicalise the typed venue via Google Places text search.
+    Users type an AREA as often as a venue ("St John's Wood" for Harris Academy St John's Wood); every
+    downstream query keys on the venue NAME, so an area name gives area-wide noise. Places + the postcode
+    resolves it to the actual establishment. Returns (name, postcode, own_domain)."""
+    if not GPLACES: return venue, pc, ''
+    def lookup(q):
+        body = json.dumps({"textQuery": q, "maxResultCount": 5, "regionCode": "GB", "languageCode": "en"}).encode()
+        try:
+            r = urllib.request.Request("https://places.googleapis.com/v1/places:searchText", data=body,
+                headers={"Content-Type": "application/json", "X-Goog-Api-Key": GPLACES,
+                         "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.types,places.websiteUri"})
+            return json.load(urllib.request.urlopen(r, timeout=25)).get('places', [])
+        except Exception as e:
+            sys.stderr.write(f"places err {e}\n"); return []
+    pcol, oc = collapse(pc), outcode(pc)
+    def score(p):
+        addr = collapse(p.get('formattedAddress', '')); t = p.get('types') or []
+        s = 0
+        if pcol and pcol in addr: s += 4
+        elif oc and oc in addr: s += 1
+        if any(x in t for x in GOOD_TYPES): s += 2
+        if any(x in t for x in AREA_TYPES): s -= 5
+        return s
+    # Query ladder: the typed text first; if that only lands on an area/postcode (users type "St John's Wood"
+    # as often as the school name), ask Places for the establishment AT that postcode instead.
+    best = None
+    for q in [f"{venue} {pc}".strip()] + ([f"school {pc}", f"venue {pc}"] if pc else []):
+        places = lookup(q)
+        cand = max(places, key=score) if places else None
+        if cand and score(cand) > 0: best = cand; break
+    if not best: return venue, pc, ''
+    name = ((best.get('displayName') or {}).get('text') or venue).strip()
+    m = UKPC_RE.search(best.get('formattedAddress') or '')
+    newpc = f"{m.group(1)} {m.group(2)}".upper() if m else pc
+    if pc and collapse(newpc)[:len(oc)] != oc: newpc = pc  # different outcode = wrong place, keep what was typed
+    own = urllib.parse.urlparse(best.get('websiteUri') or '').netloc.lower().replace('www.', '')
+    return name, (newpc or pc), own
+
 def synth(prefix, key):
     h = 0
     for ch in (prefix + '|' + key): h = (h * 31 + ord(ch)) & 0x7fffffff
@@ -89,7 +135,7 @@ def dfs(kw, depth=30, retries=2):
 def fetch(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        return url, urllib.request.urlopen(req, timeout=12).read()[:400000].decode('utf-8', 'ignore')
+        return url, urllib.request.urlopen(req, timeout=12).read()[:800000].decode('utf-8', 'ignore')
     except Exception:
         return url, ''
 
@@ -134,15 +180,30 @@ PLACEHOLDER_PHONES = {'01234567890', '02012345678', '07123456789', '00000000000'
 def _registrable(dom):
     return '.'.join((dom or '').lower().split('.')[-2:])
 
+OBF_RE = re.compile(r'([a-z0-9._%+\-]{2,})\s*(?:\[\s*(?:at|@)\s*\]|\(\s*(?:at|@)\s*\)|\s+at\s+)\s*'
+                    r'([a-z0-9\-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+|\.)\s*[a-z0-9\-]+)+)', re.I)
+def deobfuscate(text):
+    """info [at] example [dot] org — small orgs hide their address this way and we were missing them."""
+    out = []
+    for local, dom in OBF_RE.findall(text):
+        d = re.sub(r'\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+)\s*', '.', dom, flags=re.I)
+        d = re.sub(r'\s+', '', d)
+        if d.count('.') >= 1 and len(d.split('.')[-1]) >= 2 and re.fullmatch(r'[a-z0-9.\-]+', d, re.I):
+            out.append(f"{local.lower()}@{d.lower()}")
+    return out
+
 def contacts(raw, org_domain):
-    """Pull a VALIDATED email + phone from an org's own page. Rejects asset strings, placeholders, junk."""
+    """Pull a VALIDATED email + phone from an org's own page. Rejects asset strings, placeholders, junk.
+    mailto:/tel: links are trusted first — they are what the org actually publishes as its contact."""
     if not raw: return None, None
     text = html.unescape(raw)
+    linked = [m.lower().split('?')[0].strip() for m in re.findall(r'(?i)href=["\']mailto:([^"\'?>]+)', text)]
     # email
     email = None
     cands = []
-    for m in EMAIL_RE.findall(text):
+    for m in linked + EMAIL_RE.findall(text) + deobfuscate(text):
         e = m.lower().strip('.')
+        if e.count('@') != 1 or not EMAIL_RE.fullmatch(e): continue
         dom = e.split('@')[1]
         if any(e.endswith(x) or ('.' + x.strip('.')) in dom for x in ASSET_EXT): continue
         if dom.endswith(ASSET_EXT): continue
@@ -155,9 +216,10 @@ def contacts(raw, org_domain):
         own = [e for e in cands if _registrable(e.split('@')[1]) == org_reg]
         pref = [e for e in cands if e.split('@')[0] in PREF_LOCAL]
         email = (own and (next((e for e in own if e.split('@')[0] in PREF_LOCAL), own[0]))) or (pref[0] if pref else cands[0])
-    # phone (UK)
+    # phone (UK) — tel: links first, then anything phone-shaped in the text
     phone = None
-    for m in PHONE_RE.findall(text):
+    tel = [re.sub(r'[^\d+]', '', m) for m in re.findall(r'(?i)href=["\']tel:([^"\'>]+)', text)]
+    for m in tel + PHONE_RE.findall(text):
         d = re.sub(r'\D', '', m)
         if d.startswith('44'): d = '0' + d[2:]
         if len(d) not in (10, 11) or not d.startswith('0'): continue
@@ -191,13 +253,18 @@ def sublinks(rawhtml, base, dom, extra):
     return out[:3]
 
 # ---------------- discovery ----------------
-def queries_for(venue, pc):
+EXCLUDE_SITES = ['tes.com','eteach.com','indeed.com','rightmove.co.uk','theguardian.com','linkedin.com',
+                 'locrating.com','schoolsweek.co.uk']
+def queries_for(venue, pc, own=''):
+    # Exclude the venue's OWN domain + the big job/property/news sites from venue-name queries: the school's
+    # own pages otherwise fill the ranking and the hirers (who name the venue on their own sites) never surface.
+    ex = ' '.join(f'-site:{d}' for d in ([own] if own else []) + EXCLUDE_SITES)
     acts = ['football','netball','basketball','cricket','gymnastics','dance','ballet','karate','martial arts','tuition',
             'language school','saturday school','supplementary school','madrasah','quran','persian school','tamil school',
             'german saturday school','korean church','church','scouts','toddler group','holiday camp','music lessons',
             'drama','classes','club','academy','timetable']
-    q = [venue, f'{venue} {pc}'] + [f'{a} {venue}' for a in acts]
-    q += [f'{a} "{venue}"' for a in ['madrasah','tamil school','persian school','german saturday school','church','football','dance']]
+    q = [f'{venue} {ex}', f'{venue} {pc} {ex}'] + [f'{a} {venue} {ex}' for a in acts]
+    q += [f'{a} "{venue}" {ex}' for a in ['madrasah','tamil school','persian school','german saturday school','church','football','dance']]
     q += [f'"{pc}" charity', f'"{pc}" church', f'"{pc}" club', f'"{pc}" academy',
           f'site:register-of-charities.charitycommission.gov.uk "{pc}"', f'site:findachurch.co.uk "{pc}"']
     q += [f'site:{d} "{venue}"' for d in ['classforkids.io','happity.co.uk','playfootball.net','clubspark.lta.org.uk','pitchfinder.org.uk']]
@@ -209,17 +276,19 @@ def tie_kind(blob, vcol, pcol, vtoks, oc):
     if len(vtoks) >= 2 and oc and oc in blob and all(t in blob for t in vtoks): return 'venue'
     return None
 
-def discover_web(venue, pc):
+def discover_web(venue, pc, own=''):
     vcol, pcol, vtoks, oc = collapse(venue), collapse(pc), vtokens(venue), outcode(pc)
+    ownreg = _registrable(own) if own else ''
     raw, seen, cost = [], set(), 0.0
-    for q in queries_for(venue, pc):
+    for q in queries_for(venue, pc, own):
         items, qcost = dfs(q)
         cost += qcost
         for r in items:
             if r['url'] in seen: continue
             seen.add(r['url']); r['domain'] = urllib.parse.urlparse(r['url']).netloc.lower().replace('www.', '')
             raw.append(r)
-    cands = [r for r in raw if not noisy(r['domain']) and 'facebook.com' not in r['domain']]
+    cands = [r for r in raw if not noisy(r['domain']) and 'facebook.com' not in r['domain']
+             and not (ownreg and _registrable(r['domain']) == ownreg)]
     cands.sort(key=lambda c: ('charitycommission' in c['domain']) or (pcol in collapse(c['title']+c['snippet'])) or (vcol in collapse(c['title']+c['snippet'])), reverse=True)
     cands = cands[:200]
     vmeta = (vcol, pcol, vtoks, oc)
@@ -276,9 +345,16 @@ def discover_web(venue, pc):
             for dom, title, su, tie, sname, ev, em, ph in ex.map(process_sub, targets):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname, 'evidence': ev, 'email': em, 'phone': ph}
-    # Contact backfill: orgs that tied but exposed no contact on the main page — read their /contact page
-    backfill = [(dom, d['clinks'][0]) for dom, d in byd.items()
-                if not d.get('email') and not d.get('phone') and d.get('clinks')]
+    # Contact backfill: orgs that tied but exposed no contact yet — read every plausible contact page.
+    # Contact coverage is the whole point of a lead (a name with no way to reach them is not actionable),
+    # so this goes wider than the one linked page it used to try: all contact-ish links, then the
+    # conventional paths, then the site root.
+    GUESS = ['/contact', '/contact/', '/contact-us', '/contact-us/', '/about', '/about-us', '/']
+    backfill = []
+    for dom, d in byd.items():
+        if not dom or d.get('email'): continue
+        urls = list(dict.fromkeys((d.get('clinks') or [])[:3] + [f"https://{dom}{p}" for p in GUESS]))
+        for u in urls[:7]: backfill.append((dom, u))
     if backfill:
         def get_contact(t):
             dom, su = t
@@ -450,11 +526,19 @@ def run(sid):
     pc = (s.get('postcode') or '').strip()
     print(f"[{sid}] {venue} ({pc})")
     set_status(sid, 'searching')
+    cname, cpc, own = resolve_venue(venue, pc)
+    if (cname, cpc) != (venue, pc):
+        print(f"  canonical: {cname} ({cpc}){' own site ' + own if own else ''}")
+        # write it back so the results, the cache key and monitoring all use the canonical venue
+        sreq("PATCH", "group_searches", {"venue_name": cname, "postcode": cpc}, params=f"?id=eq.{sid}")
+        venue, pc = cname, cpc
+    elif own:
+        print(f"  own site {own}")
     prior = cache_lookup(venue, pc, sid)
     if prior:
         sreq("POST", "rpc/copy_venue_search_results", {"p_from": prior, "p_to": sid})
         set_status(sid, 'complete'); print(f"  cache hit from {prior} — £0"); return
-    web, dfs_cost = discover_web(venue, pc)
+    web, dfs_cost = discover_web(venue, pc, own)
     db = db_postcode(pc)
     fb = fb_posts(venue, pc)
     cands = web + db + fb
@@ -466,14 +550,17 @@ def run(sid):
         c['tier'] = conf or ('confirmed' if c['tie'] == 'postcode' else 'likely'); c['category'] = cat
         kept.append(to_result(c))
     apify_cost = 0.05 if fb else 0.0
-    total = round(dfs_cost + gate_cost + apify_cost, 4)
-    print(f"  kept {len(kept)} of {len(cands)}")
-    print(f"  SPEND: dataforseo=${dfs_cost} gate=${gate_cost} apify=${apify_cost} | total=${total}")
+    g_calls = 1 if GPLACES else 0
+    g_cost = round(0.032 * g_calls, 4)  # Places Text Search
+    total = round(dfs_cost + gate_cost + apify_cost + g_cost, 4)
+    with_contact = sum(1 for k in kept if k.get('email') or k.get('phone_number'))
+    print(f"  kept {len(kept)} of {len(cands)} | {with_contact} with a contact")
+    print(f"  SPEND: dataforseo=${dfs_cost} gate=${gate_cost} apify=${apify_cost} places=${g_cost} | total=${total}")
     log_spend(sid, venue, pc, len(kept), dfs_cost, gate_cost, apify_cost, total)
     sreq("POST", "rpc/process_venue_hirer_results", {
         "p_search_id": sid, "p_results": kept,
-        "p_cost_google": 0, "p_cost_dataforseo": dfs_cost, "p_cost_apify": apify_cost,
-        "p_google_calls": 0})
+        "p_cost_google": g_cost, "p_cost_dataforseo": dfs_cost, "p_cost_apify": apify_cost,
+        "p_google_calls": g_calls})
     # shared enrichment (still n8n): promotes staged rows -> vivify_organisations + contact details + links + cleanup trigger
     try:
         urllib.request.urlopen(urllib.request.Request(
