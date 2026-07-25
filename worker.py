@@ -44,7 +44,8 @@ NOISE = ['wikipedia.org','indeed.','reed.co.uk','totaljobs','glassdoor','tes.com
     'netmums','trip.com','klook','viator','timeout.com','nhs.uk','heyschools','heygolf','schoolratings','schoolsfootball','schoolsnetball','schoolsbasketball',
     'allschools','schoolstogether','schoolowl','goodschools','locatethis','cleanair','primarytimes']
 AGG = ['charitycommission','findachurch','classforkids','pitchfinder','clubspark','playfootball','happity',
-       'footyaddicts','hoop.co.uk','eventbrite','meetup']
+       'footyaddicts','hoop.co.uk','eventbrite','meetup','allevents','skiddle','ticketsource','fatsoma',
+       'dice.fm','eventful','tickettailor','trybooking','bookwhen']
 def noisy(dom):
     if 'charitycommission' in dom or 'findachurch' in dom: return False
     if dom.endswith('gov.uk') and 'charitycommission' not in dom: return True
@@ -58,7 +59,10 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'exams? assistant', r'football pitch', r'auditorium|drama studio|gymnasium|sports hall', r'pitches? - ',
     r'match overview', r'\bvs\.? ', r'booking system', r'events calendar', r'girls pe ', r'^event:',
     r'^results?$', r'^news$', r'leggings', r'^\d', r'^map of', r'^area information', r'postcode s',
-    r"^(baby|toddler|kids|children'?s) .* classes", r'^classes (in|near)', r'^things to do']]
+    r"^(baby|toddler|kids|children'?s) .* classes", r'^classes (in|near)', r'^things to do',
+    # session descriptions and age groups are not organisations
+    r'^u\d{1,2}\b', r'^(under|year) \d', r'^\w+ (schools?|clubs?|classes) in ', r'training$', r'^(junior|senior|adult)s? ',
+    r'^(winter|summer|spring|autumn) ', r'^(half.term|holiday) ', r'^book ', r'^join ', r'^register ']]
 # A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
 BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
                  'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
@@ -486,6 +490,9 @@ def gate(cands, venue, pc):
         f'Happity, Footyaddicts, Eventbrite, Trip.com, ClassForKids, Meetup and the like), useful=false even when the '
         f'listing names this venue. An operator that runs its OWN leagues, classes or camps at the venue IS a hirer, '
         f'even if it also sells places online. '
+        f'The name must be the organisation\'s own trading name. Session descriptions, age groups and listing '
+        f'headings ("U14", "Junior and Senior winter training", "Drama Schools in Stockport", "Holiday camp") are '
+        f'useful=false — Vivify has to be able to ring a named club. '
         f'confidence="confirmed" if it explicitly names this venue or postcode, else "likely". When in doubt useful=false.\n'
         f'Return ONLY a JSON array: [{{"i":<index>,"useful":true|false,"confidence":"confirmed"|"likely","category":"<short>"}}]\n\n'
         + items)
