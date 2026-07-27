@@ -210,10 +210,16 @@ def dfs(kw, depth=30, retries=2):
             if attempt == retries: sys.stderr.write(f"dfs err [{kw[:30]}]: {e}\n"); return [], 0.0
             time.sleep(1.5)
 
-def fetch(url):
+def fetch(url, timeout=8):
+    """One slow site should not hold up the search: a tight timeout plus a read cap means the worst
+    case per page is bounded. (Page reading swung between 46s and 289s a run before this.)"""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        return url, urllib.request.urlopen(req, timeout=12).read()[:250000].decode('utf-8', 'ignore')
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ctype = (r.headers.get('Content-Type') or '').lower()
+            if ctype and 'html' not in ctype and 'text' not in ctype:
+                return url, ''  # PDFs and images cost time and never carry the evidence we want
+            return url, r.read(250000).decode('utf-8', 'ignore')
     except Exception:
         return url, ''
 
@@ -862,13 +868,20 @@ def run(sid):
     if not UKPC_RE.fullmatch((pc or '').strip()):
         print(f"  refusing to run: '{pc}' is not a valid UK postcode")
         set_status(sid, 'error'); return
+    typed_pc = pc
     set_status(sid, 'searching')
     cname, cpc, own = resolve_venue(venue, pc)
     print(f"  places={'on' if GPLACES else 'OFF'} resolved={cname!r} {cpc!r} own={own!r}")
     if (cname, cpc) != (venue, pc):
         print(f"  canonical: {cname} ({cpc}){' own site ' + own if own else ''}")
-        # write it back so the results, the cache key and monitoring all use the canonical venue
-        sreq("PATCH", "group_searches", {"venue_name": cname, "postcode": cpc}, params=f"?id=eq.{sid}")
+        patch = {"venue_name": cname, "postcode": cpc}
+        # Say so when we searched a different postcode from the one typed. Silently correcting it means
+        # a mistyped postcode belonging to ANOTHER school would be searched with nobody any the wiser.
+        if collapse(cpc) != collapse(typed_pc):
+            note = f"Searched {cname} at {cpc}. You entered {typed_pc}; Google Places lists this venue at {cpc}."
+            patch["venue_note"] = note
+            print(f"  NOTE: postcode corrected {typed_pc} -> {cpc}")
+        sreq("PATCH", "group_searches", patch, params=f"?id=eq.{sid}")
         venue, pc = cname, cpc
     elif own:
         print(f"  own site {own}")
