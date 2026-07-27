@@ -364,16 +364,9 @@ def queries_for(venue, pc, own=''):
     acts = ['football','netball','basketball','cricket','gymnastics','dance','ballet','karate','martial arts','tuition',
             'language school','saturday school','supplementary school','madrasah','quran','persian school','tamil school',
             'german saturday school','korean church','church','scouts','toddler group','holiday camp','music lessons',
-            'drama','classes','club','academy','timetable',
-            # widened after Harrytown came back thin: these are the groups that actually book school halls
-            'brownies','guides','cubs','youth club','boxing','taekwondo','ju jitsu','judo','cheerleading',
-            'trampolining','athletics','walking football','futsal','volleyball','table tennis','badminton',
-            'slimming world','weight watchers','bootcamp','zumba','pilates','yoga','choir','brass band',
-            'orchestra','amateur dramatics','bridge club','bingo','prayer','mosque','sunday school','play group']
+            'drama','classes','club','academy','timetable']
     q = [f'{venue} {ex}', f'{venue} {pc} {ex}'] + [f'{a} {venue} {ex}' for a in acts]
     q += [f'{a} "{venue}" {ex}' for a in ['madrasah','tamil school','persian school','german saturday school','church','football','dance']]
-    # phrasing hirers actually use about where they meet
-    q += [f'"{p} {venue}"' for p in ['meets at', 'sessions at', 'based at', 'training at', 'classes at', 'every week at']]
     q += [f'"{pc}" charity', f'"{pc}" church', f'"{pc}" club', f'"{pc}" academy',
           f'site:register-of-charities.charitycommission.gov.uk "{pc}"', f'site:findachurch.co.uk "{pc}"']
     q += [f'site:{d} "{venue}"' for d in ['classforkids.io','happity.co.uk','playfootball.net','clubspark.lta.org.uk','pitchfinder.org.uk']]
@@ -404,7 +397,7 @@ def discover_web(venue, pc, own=''):
     cands = [r for r in raw if not noisy(r['domain']) and 'facebook.com' not in r['domain']
              and not (ownreg and _registrable(r['domain']) == ownreg)]
     cands.sort(key=lambda c: ('charitycommission' in c['domain']) or (pcol in collapse(c['title']+c['snippet'])) or (vcol in collapse(c['title']+c['snippet'])), reverse=True)
-    cands = cands[:280]
+    cands = cands[:200]
     vmeta = (vcol, pcol, vtoks, oc)
     # Process each page AS IT IS FETCHED and discard the HTML — never hold all pages in memory
     # (that OOM-killed the worker on the 512MB instance). Each record is small.
