@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
 """HTTP front for the venue-hirers worker (Render web service).
 POST /webhook/vivify-venue-hirers  {"search_id": <id>}  -> acks immediately, runs discovery in a
-background thread (FE polls Supabase for status, same as the old n8n flow). GET / -> health check."""
-import json, threading, traceback
+separate PROCESS (FE polls Supabase for status). GET / -> health check.
+
+Why a process and not a thread: parsing a few hundred pages is CPU-bound regex work, and Python's
+GIL meant it starved this HTTP server on Render's half-CPU instance. Health checks then timed out and
+Render killed the instance mid-search, leaving the search stuck at 'searching' forever. A child
+process leaves the server responsive, and if it dies we can see the exit code and fail the search
+honestly instead of letting the UI spin."""
+import json, threading, traceback, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import worker
 
 PORT = int(os.environ.get('PORT', '10000'))
+WORKER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker.py')
 
 def run_search(sid):
     try:
-        worker.run(sid)
+        p = subprocess.run([sys.executable, WORKER_PY, str(sid)], timeout=1800)
+        if p.returncode != 0:
+            sys.stderr.write(f"worker for {sid} exited {p.returncode}\n")
+            try: worker.set_status(sid, 'error')
+            except Exception: pass
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"worker for {sid} timed out\n")
+        try: worker.set_status(sid, 'error')
+        except Exception: pass
     except Exception:
         sys.stderr.write(f"worker error for {sid}:\n{traceback.format_exc()}\n")
         try: worker.set_status(sid, 'error')
