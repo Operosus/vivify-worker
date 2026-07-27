@@ -755,11 +755,18 @@ def gate(cands, venue, pc):
         f'Happity, Footyaddicts, Eventbrite, Trip.com, ClassForKids, Meetup and the like), useful=false even when the '
         f'listing names this venue. An operator that runs its OWN leagues, classes or camps at the venue IS a hirer, '
         f'even if it also sells places online. '
-        f'The name must be the organisation\'s own trading name. Session descriptions, age groups and listing '
-        f'headings ("U14", "Junior and Senior winter training", "Drama Schools in Stockport", "Holiday camp") are '
-        f'useful=false — Vivify has to be able to ring a named club. '
+        f'Each candidate label below was scraped from a web page title, so it is often NOT a clean name: it may be '
+        f'a headline, a match report ("Marple Athletic Red U16 6-0 Bollington Bullets"), a section heading '
+        f'("Club matches"), a listing ("Martial Arts Clubs Stockport"), a session description ("Junior and Senior '
+        f'winter training"), an age group ("U14"), or a name with a location tail ("Revolution Martial Arts in '
+        f'Marple, Stockport SK6 6LB"). Your job includes NAMING the organisation.\n'
+        f'Set org_name to the organisation\'s own trading name as it would appear on its letterhead — no location '
+        f'tail, no "in Stockport", no session or age detail, no headline words. If the label is a headline or report, '
+        f'extract the club from it. If you CANNOT identify a specific named organisation, set useful=false: Vivify '
+        f'has to be able to ring a named club, so anything unnameable is worthless to them.\n'
         f'confidence="confirmed" if it explicitly names this venue or postcode, else "likely". When in doubt useful=false.\n'
-        f'Return ONLY a JSON array: [{{"i":<index>,"useful":true|false,"confidence":"confirmed"|"likely","category":"<short>"}}]\n\n'
+        f'Return ONLY a JSON array: [{{"i":<index>,"useful":true|false,"org_name":"<clean trading name>",'
+        f'"confidence":"confirmed"|"likely","category":"<short>"}}]\n\n'
         + items)
     body = json.dumps({"model": "gpt-4o", "temperature": 0, "max_tokens": 4000,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
@@ -776,6 +783,10 @@ def gate(cands, venue, pc):
         for i, c in enumerate(cands):
             v = verdict.get(i)
             if v and v.get('useful'):
+                # The gate names the organisation; the scraped page title is only a hint. This is what
+                # stops headlines and listing labels reaching Vivify — a pattern list never keeps up.
+                nm = (v.get('org_name') or '').strip()
+                if nm and 3 <= len(nm) <= 60 and not is_junk(nm): c['name'] = tidy_name(nm)
                 res.append((True, 'confirmed' if v.get('confidence') == 'confirmed' else 'likely', v.get('category', '')))
             else:
                 res.append((False, '', ''))
