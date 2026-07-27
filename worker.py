@@ -78,8 +78,15 @@ SUPPLEMENTARY = re.compile(r'\b(tamil|persian|farsi|german|french|spanish|polish
     r'hebrew|torah|sikh|hindu|church|christian|catholic mission|dance|ballet|drama|stage|theatre|performing|'
     r'music|singing|maths|tuition|tutor|language|driving|swim|football|martial|karate|judo|gymnastic|circus|'
     r'forest|montessori|nursery|preschool|pre-school|holiday|coding|chess|art)\b', re.I)
+EDU_SIGNAL = re.compile(r'\b(high|primary|junior|infant|secondary|grammar|comprehensive|voluntary|'
+                        r'church of england|c of e|catholic|sixth form|academy trust|free school)\b', re.I)
 def mainstream_school(n):
-    return bool(re.search(r'\b(school|academy|college)\b', n, re.I)) and not SUPPLEMENTARY.search(n)
+    """"Academy" alone is not a school — PSG Academy UK is a football coaching business and a real hirer.
+    Treat it as a school only when the name says "school"/"college", or pairs "academy" with an
+    education word (voluntary, catholic, grammar, high...)."""
+    if SUPPLEMENTARY.search(n): return False
+    if re.search(r'\b(school|college)\b', n, re.I): return True
+    return bool(re.search(r'\bacademy\b', n, re.I) and EDU_SIGNAL.search(n))
 
 # Facebook authors are often just people ("Wendy Chalmers"), not the group hiring the hall. A person's
 # name is only a lead if they are visibly trading, which shows up as an organisation word in the name.
@@ -532,11 +539,17 @@ def merge_duplicates(cands):
                 hit = o; break
         if hit is None:
             out.append(c); continue
-        for f in ('email', 'phone', 'website', 'evidence_date', 'image'):
+        for f in ('email', 'phone', 'website', 'image'):
             if not hit.get(f) and c.get(f): hit[f] = c[f]
-        # keep the fuller proof, and remember the other source so the row still shows both
-        if len(c.get('evidence') or '') > len(hit.get('evidence') or ''):
-            hit['evidence'], hit['evidence_date'] = c.get('evidence'), c.get('evidence_date') or hit.get('evidence_date')
+        # Newest proof wins: if a group was mentioned a year ago and again yesterday, Vivify sees
+        # yesterday. Only fall back to "longest" when neither mention carries a date.
+        cd, hd = (c.get('evidence_date') or '')[:10], (hit.get('evidence_date') or '')[:10]
+        newer = (cd > hd) if (cd and hd) else (bool(cd) and not hd)
+        longer = not cd and not hd and len(c.get('evidence') or '') > len(hit.get('evidence') or '')
+        if newer or longer:
+            hit['evidence'] = c.get('evidence') or hit.get('evidence')
+            hit['evidence_date'] = c.get('evidence_date') or hit.get('evidence_date')
+            if c.get('image'): hit['image'] = c['image']
         if len(c.get('name') or '') > len(hit.get('name') or '') and not is_junk(c.get('name')):
             hit['name'] = c['name']
     return out
@@ -861,17 +874,14 @@ def run(sid):
     cands = web + site + db + fb + cfk
     print(f"  candidates: web={len(web)} db={len(db)} fb={len(fb)} | gate={'gpt-4o' if OPENAI_KEY else 'DETERMINISTIC(no key)'}")
     verdicts, gate_cost = gate(cands, venue, pc)
-    survivors, stale = [], 0
-    cutoff = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 365 * 86400))
+    survivors = []
     for c, (ok, conf, cat) in zip(cands, verdicts):
         if not ok: continue
-        # A page that dates itself more than a year back is a stale listing, not a live booking.
-        # Undated pages stay: most small club sites publish no date at all.
-        ed = (c.get('evidence_date') or '')[:10]
-        if ed and ed < cutoff: stale += 1; continue
         c['tier'] = conf or ('confirmed' if c['tie'] == 'postcode' else 'likely'); c['category'] = cat
         survivors.append(c)
-    if stale: print(f"  dropped {stale} with evidence over a year old")
+    # Old evidence is kept — it still shows a group used the venue, and the card carries the date so
+    # Vivify can judge it. What matters is that where a group appears more than once we show its MOST
+    # RECENT proof, which merge_duplicates does below.
     before = len(survivors)
     survivors = merge_duplicates(survivors)
     if before != len(survivors): print(f"  merged {before - len(survivors)} duplicate listings")
