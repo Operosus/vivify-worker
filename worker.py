@@ -66,7 +66,11 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'showcase$', r'\bshowcase\b', r'open day', r'presentation (evening|night)', r'fun day', r'taster session',
     r'(christmas|easter|summer) (show|fair|fayre|party)',
     # another mainstream school is a venue, not a hirer (supplementary/faith schools don't use these words)
-    r'\b(high school|primary school|infant school|junior school|grammar school|voluntary academy|academy trust|sixth form)\b']]
+    r'\b(high school|primary school|infant school|junior school|grammar school|voluntary academy|academy trust|sixth form)\b',
+    # match reports and page headlines, not organisations
+    r'\d+\s*-\s*\d+', r'^club matches$', r'^(fixtures?|matches|results|tables?|standings)$',
+    r'\b(now offer|now offers|are pleased|is pleased|welcomes?|announce)\b',
+    r'^(martial arts|dance|football|netball|cricket|tennis|badminton|gymnastics) (clubs?|classes|schools?) ']]
 # A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
 BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
                  'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
@@ -172,6 +176,13 @@ def resolve_venue(venue, pc):
     if pc and collapse(newpc)[:len(oc)] != oc: newpc = pc  # different outcode = wrong place, keep what was typed
     own = urllib.parse.urlparse(best.get('websiteUri') or '').netloc.lower().replace('www.', '')
     return name, (newpc or pc), own
+
+LOCATION_TAIL = re.compile(r'\s+(in|at|near)\s+[A-Z][\w\'\-]*(,[^,]{0,40})*\s*(,?\s*[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})?\s*$', re.I)
+def tidy_name(n):
+    """"Revolution Martial Arts in Marple, Stockport SK6 6LB" is the club plus a location tail scraped
+    from the page title. Vivify wants the club."""
+    out = LOCATION_TAIL.sub('', (n or '').strip()).strip(' ,-|')
+    return out if len(out) >= 3 else (n or '').strip()
 
 def synth(prefix, key):
     h = 0
@@ -465,7 +476,7 @@ def discover_web(venue, pc, own=''):
     print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
     out, seen_n = [], set()
     for dom, d in byd.items():
-        nm = d.get('sitename') or brand(d['titles'], dom)
+        nm = tidy_name(d.get('sitename') or brand(d['titles'], dom))
         if is_junk(nm) or collapse(nm) in vcol or vcol in collapse(nm): continue
         k = collapse(nm)[:20]
         if not k or k in seen_n: continue
@@ -476,6 +487,7 @@ def discover_web(venue, pc, own=''):
                     'email': d.get('email'), 'phone': d.get('phone'), 'clinks': d.get('clinks', []),
                     'src': 'dataforseo'})
     for r in agg:
+        r['name'] = tidy_name(r['name'])
         if is_junk(r['name']) or collapse(r['name']) in vcol or vcol in collapse(r['name']): continue
         # On a directory page the hirer is the org LISTED, never the directory — drop Footyaddicts,
         # Netmums and friends when the extracted name is just the platform's own brand.
