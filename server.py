@@ -17,9 +17,10 @@ import worker
 PORT = int(os.environ.get('PORT', '10000'))
 WORKER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker.py')
 
-def run_search(sid):
+def run_search(sid, force=False):
     try:
-        p = subprocess.run([sys.executable, WORKER_PY, str(sid)], timeout=1800)
+        cmd = [sys.executable, WORKER_PY, str(sid)] + (['--force'] if force else [])
+        p = subprocess.run(cmd, timeout=1800)
         if p.returncode != 0:
             sys.stderr.write(f"worker for {sid} exited {p.returncode}\n")
             try: worker.set_status(sid, 'error')
@@ -63,10 +64,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(n) or b'{}')
             sid = int(body.get('search_id'))
+            force = bool(body.get('force'))
         except Exception:
             return self._send(400, {"error": "search_id required"})
-        threading.Thread(target=run_search, args=(sid,), daemon=True).start()
-        self._send(200, {"success": True, "search_id": sid, "status": "searching"})
+        threading.Thread(target=run_search, args=(sid, force), daemon=True).start()
+        self._send(200, {"success": True, "search_id": sid, "status": "searching", "force": force})
 
     def log_message(self, *a): pass  # quiet default logging
 

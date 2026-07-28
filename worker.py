@@ -857,7 +857,9 @@ def to_result(c):
         "evidence_date": c.get('evidence_date'), "confidence_tier": c['tier'],
     }
 
-def run(sid):
+def run(sid, force=False):
+    """force=True skips the 14-day cache. Monitoring runs MUST bypass it: their whole job is to spot
+    hirers who appeared since last time, and a cached copy of the previous run can never do that."""
     s = get_search(sid)
     if not s: sys.exit(f"search {sid} not found")
     venue = (s.get('venue_name') or s.get('search_name') or '').strip()
@@ -885,7 +887,7 @@ def run(sid):
         venue, pc = cname, cpc
     elif own:
         print(f"  own site {own}")
-    prior = cache_lookup(venue, pc, sid)
+    prior = None if force else cache_lookup(venue, pc, sid)
     if prior:
         sreq("POST", "rpc/copy_venue_search_results", {"p_from": prior, "p_to": sid})
         set_status(sid, 'complete'); print(f"  cache hit from {prior} — £0"); return
@@ -937,4 +939,4 @@ def run(sid):
     print(f"  promoted {res.get('promoted') if isinstance(res, dict) else res} organisations — status complete")
 
 if __name__ == '__main__':
-    run(int(sys.argv[1]))
+    run(int(sys.argv[1]), force='--force' in sys.argv[2:])
