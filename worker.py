@@ -72,9 +72,19 @@ JUNK_RE = [re.compile(p, re.I) for p in [
     r'\b(now offer|now offers|are pleased|is pleased|welcomes?|announce)\b',
     r'^(martial arts|dance|football|netball|cricket|tennis|badminton|gymnastics) (clubs?|classes|schools?) ']]
 # A page title that is just the activity ("Netball") names no organisation — the hirer is unidentifiable.
+# An activity is not an organisation. Vivify have to be able to ring a named club, so a result called
+# "Zumba" is worthless to them even when the evidence genuinely names the venue — which it did on Luke's
+# Blenheim search (search 189), where a real Zumba class at Blenheim High School surfaced under the bare
+# brand name and read to him as a bug. Branded formats (zumba, clubbercise, boxercise) belong here for the
+# same reason the generic ones do. Full-name match only, so "Revolution Martial Arts" is unaffected.
 BARE_ACTIVITY = {'netball','football','basketball','cricket','tennis','badminton','dance','ballet','gymnastics',
                  'karate','yoga','pilates','drama','music','tuition','classes','clubs','camps','training',
-                 'holiday camps','football training','sports','fitness','swimming','athletics','rugby','hockey'}
+                 'holiday camps','football training','sports','fitness','swimming','athletics','rugby','hockey',
+                 'zumba','clubbercise','boxercise','bootcamp','boot camp','spin','spinning','aerobics','boxing',
+                 'kickboxing','taekwondo','judo','jiu jitsu','martial arts','cheerleading','trampolining',
+                 'volleyball','table tennis','squash','archery','fencing','street dance','musical theatre',
+                 'after school club','after school clubs','holiday club','holiday clubs','walking football',
+                 'sports coaching','multi sports','multi-sports','soft play','toddler group','youth club'}
 # A supplementary, faith or activity school hires halls; a mainstream school is somebody else's venue.
 # These tokens are what tells the two apart, since both are "... School".
 SUPPLEMENTARY = re.compile(r'\b(tamil|persian|farsi|german|french|spanish|polish|greek|chinese|mandarin|arabic|'
