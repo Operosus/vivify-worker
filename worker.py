@@ -237,6 +237,12 @@ def page_blob(raw, snippet, title):
     raw = re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw)
     return collapse(title + ' ' + snippet + ' ' + html.unescape(re.sub(r'(?is)<[^>]+>', ' ', raw)))
 
+def page_text(raw):
+    """Readable text, for showing a page to the model. page_blob() collapses everything for substring
+    matching, which is unreadable."""
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
+        re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or '')))).strip()
+
 def page_evidence(raw, venue, pc):
     """The passage around the venue mention. Vivify reads this before ringing a club, so give them
     enough to judge it (day, time, activity), not a clipped fragment."""
@@ -302,8 +308,18 @@ FREEMAIL = {'gmail.com','googlemail.com','hotmail.com','hotmail.co.uk','outlook.
 PREF_LOCAL = ('info', 'hello', 'contact', 'enquiries', 'enquiry', 'admin', 'office', 'hi', 'team', 'bookings', 'reception')
 PLACEHOLDER_PHONES = {'01234567890', '02012345678', '07123456789', '00000000000', '01111111111', '07000000000', '07700900000'}
 
+# The last two labels are NOT the registrable domain under a multi-part suffix: "troynetballclub.co.uk"
+# reduced to "co.uk", so every .co.uk domain compared equal to every other .co.uk domain. That silently
+# defeated the own-domain test in contacts() — an email at any unrelated .co.uk address on a page counted
+# as the organisation's own — and the aggregator-brand check in discover_web(), which read the brand as
+# "co". UK suffixes cover what this database contains; the rest fall back to two labels.
+MULTI_SUFFIX = {'co.uk','org.uk','ac.uk','gov.uk','net.uk','sch.uk','me.uk','ltd.uk','plc.uk','nhs.uk',
+                'police.uk','mod.uk','org.au','com.au','co.nz','co.za','com.pl','co.in'}
 def _registrable(dom):
-    return '.'.join((dom or '').lower().split('.')[-2:])
+    parts = [p for p in (dom or '').lower().strip('.').split('.') if p]
+    if len(parts) >= 3 and '.'.join(parts[-2:]) in MULTI_SUFFIX:
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
 
 OBF_RE = re.compile(r'([a-z0-9._%+\-]{2,})\s*(?:\[\s*(?:at|@)\s*\]|\(\s*(?:at|@)\s*\)|\s+at\s+)\s*'
                     r'([a-z0-9\-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+|\.)\s*[a-z0-9\-]+)+)', re.I)
@@ -536,6 +552,223 @@ def fill_contacts(cands):
             if em and not cands[i].get('email'): cands[i]['email'] = em
             if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
     return len(todo)
+
+# ---------------- own-site lookup ----------------
+# Measured on the pilot data 2026-08-04: when discovery reaches the organisation's OWN website 73% of
+# results carry a contact; when the proof page belongs to somebody else it is 55%, and when the only
+# evidence is a booking platform, league listing, PDF or the charity register it is effectively zero.
+# That is not an extraction failure. contacts() deliberately refuses to take an address off a domain
+# that is not the organisation's, because a page listing many groups will otherwise leak one group's
+# email onto another (a surgery page did exactly that on 27 July). The fix is to go and FIND the org's
+# own site, then run the same trusted extraction against that.
+ORG_STOP = {'the','and','of','uk','ltd','limited','cic','club','clubs','academy','group','groups','centre',
+            'center','community','association','society','school','schools','sports','sport','fc','afc','rfc',
+            'team','teams','company','classes','class','lessons','sessions','junior','juniors','youth','ladies'}
+def _org_tokens(name):
+    return [t for t in re.split(r'[^a-z0-9]+', (name or '').lower()) if len(t) > 2 and t not in ORG_STOP]
+
+def domain_carries_name(name, dom):
+    """The domain itself spells the organisation out. Strong enough to store as their website."""
+    toks = _org_tokens(name)
+    if not toks: return False
+    dcol = collapse(_registrable(dom).split('.')[0])
+    ncol = collapse(name)
+    if len(ncol) >= 8 and ncol in dcol: return True
+    joined = ''.join(toks)
+    return len(joined) >= 8 and all(t in dcol for t in toks)
+
+def site_is_theirs(name, dom, title, sitename):
+    """The bar for believing a site belongs to this organisation.
+
+    Deliberately strict. A loose match here staples a stranger's phone number onto a hirer, which is the
+    same class of error as the name-only merge that leaked a private address onto a Blenheim record. A
+    blank contact is a worse lead; a wrong contact is a wrong phone call. When in doubt, return False."""
+    if domain_carries_name(name, dom): return True
+    toks = _org_tokens(name)
+    if not toks: return False
+    dcol = collapse(_registrable(dom).split('.')[0])
+    # Otherwise the page itself must carry the whole name AND the domain must corroborate it, either
+    # with one of the distinctive words or with the organisation's initials. Title alone is not enough:
+    # we searched for this name, so a local listings site will have it in its title too.
+    tcol = collapse(f"{title or ''} {sitename or ''}")
+    # Initials of the full name, not of the distinctive tokens: PQA trade as pqacademy.com, and the "A"
+    # is the Academy that _org_tokens strips out.
+    words = [w for w in re.split(r'[^a-z0-9]+', (name or '').lower()) if w and w not in {'of','the','and','for'}]
+    initials = ''.join(w[0] for w in words)
+    corroborated = (any(t in dcol for t in toks)
+                    or (len(initials) >= 3 and dcol.startswith(initials[:3])))
+    if len(toks) >= 2 and all(t in tcol for t in toks) and corroborated: return True
+    if len(toks) == 1 and len(toks[0]) >= 8 and toks[0] in tcol and toks[0] in dcol: return True
+    return False
+
+def locality_needles(pc, venue=''):
+    """Words that should appear on the site of a group that actually meets at this venue.
+
+    Name matching alone cannot tell two identically-named groups apart, and generic names are common:
+    "Superstars" in Northwich resolved to a Warrington business, "Mini Munchkins" in York to a Montessori
+    nursery elsewhere. postcodes.io is free and needs no key."""
+    out = {collapse(pc), outcode(pc)}
+    out |= {collapse(t) for t in vtokens(venue)}
+    try:
+        with urllib.request.urlopen(f"https://api.postcodes.io/postcodes/{urllib.parse.quote(pc)}", timeout=10) as r:
+            d = json.load(r).get('result') or {}
+        # Ward, parish and district only. The region ("Yorkshire and The Humber", "North West") is far too
+        # broad to prove anything.
+        for k in ('admin_ward', 'parish', 'admin_district'):
+            for part in re.split(r'[^A-Za-z]+', d.get(k) or ''):
+                out.add(collapse(part))
+    except Exception:
+        pass
+    # The postcode and its outcode are always kept: a three-character outcode like "cw8" is short but
+    # it is the most precise needle we have.
+    keep = {n for n in out if n and len(n) >= 4 and n not in NEEDLE_STOP}
+    return keep | {n for n in (collapse(pc), outcode(pc)) if n}
+
+# Words that prove nothing about location, either because they are county-scale or because they turn up
+# in ordinary page furniture. "Fulford Social Hall" contributed "social", which matched "social media" on
+# a Montessori nursery's about page; "Hartford Church of England High School" plus the district
+# "Cheshire West and Chester" let a Warrington business through on the word "cheshire".
+NEEDLE_STOP = {
+    'social', 'hall', 'centre', 'center', 'church', 'school', 'academy', 'college', 'community', 'sports',
+    'sport', 'leisure', 'club', 'park', 'green', 'grange', 'manor', 'lodge', 'house', 'high', 'primary',
+    'junior', 'infant', 'grammar', 'catholic', 'england', 'wales', 'scotland', 'britain', 'kingdom',
+    'north', 'south', 'east', 'west', 'central', 'upper', 'lower', 'great', 'little', 'city', 'town',
+    'county', 'district', 'borough', 'council', 'unparished', 'area', 'ward', 'saint', 'trust',
+    'cheshire', 'yorkshire', 'lancashire', 'humber', 'midlands', 'surrey', 'sussex', 'essex', 'kent',
+    'hampshire', 'berkshire', 'cumbria', 'devon', 'dorset', 'norfolk', 'suffolk', 'somerset', 'wiltshire',
+    'shire', 'greater', 'metropolitan', 'valley', 'moor', 'dale', 'hill', 'wood', 'field',
+}
+
+def find_own_sites(cands, pc, own='', venue=''):
+    """For survivors with no contact whose only proof page is somebody else's, go and find the
+    organisation's own website, then extract from there.
+
+    Runs AFTER the gate and after fill_contacts, so it only ever looks at rows that survived and still
+    have nothing to ring — a handful per search, one SERP query each. It also writes the discovered site
+    back as the organisation's website, which is the right value: before this, a club whose only presence
+    was a booking platform had that platform stored as its website."""
+    oc = outcode(pc)
+    # Every survivor with nothing to ring, whatever the proof domain. fill_contacts has already tried
+    # that domain's own contact pages, so the only duplicated work is one SERP query, and the "somebody
+    # else's site" bucket is not just booking platforms: a stats mirror, an issuu magazine, a county FA
+    # PDF and a HESA spreadsheet all showed up in the pilot data.
+    todo = [i for i, c in enumerate(cands) if not c.get('email') and not c.get('phone')]
+    if not todo: return 0, 0.0, 0
+    cost, found = 0.0, 0
+
+    def search(i):
+        # Unquoted: an exact-phrase search on a club name plus an outcode returns nothing at all for
+        # plenty of small groups ("Sallys Dance", "Pentecostal Church Aveley" both came back empty).
+        # Precision comes from the checks below, not from narrowing the query.
+        items, qc = dfs(f'{cands[i]["name"]} {oc}', depth=10)
+        return i, items, qc
+
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        answers = list(ex.map(search, todo))
+
+    targets = []
+    for i, items, qc in answers:
+        cost += qc
+        c = cands[i]
+        picked = 0
+        for it in items[:8]:
+            dom = urllib.parse.urlparse(it['url']).netloc.lower().replace('www.', '')
+            if not dom or noisy(dom) or is_agg(dom) or 'facebook.com' in dom: continue
+            if own and _registrable(dom) == _registrable(own): continue  # never the venue's own site
+            targets.append((i, dom, it['url'], it['title']))
+            picked += 1
+            # Three shots, not one: the club's own site is often not the top non-directory hit
+            # (Fulford Scouts sat behind the county scouting site).
+            if picked >= 3: break
+
+    needles = locality_needles(pc, venue)
+
+    def probe(t):
+        i, dom, url, title = t
+        _, raw = fetch(url)
+        if not raw: return None
+        name = cands[i]['name']
+        if not site_is_theirs(name, dom, title, site_name(raw)): return None
+        em, ph = contacts(raw, dom)
+        text = page_text(raw)
+        if not em or not ph:
+            for su in sublinks(raw, url, dom, ['contact', 'about'])[:2]:
+                _, sraw = fetch(su)
+                if not sraw: continue
+                sem, sph = contacts(sraw, dom)
+                em, ph = em or sem, ph or sph
+                text += ' ' + page_text(sraw)
+                if em and ph: break
+        if not em and not ph: return None
+        return {'i': i, 'name': name, 'dom': dom, 'url': url, 'title': title,
+                'email': em, 'phone': ph, 'text': text[:1800]}
+
+    with cf.ThreadPoolExecutor(max_workers=6) as ex:
+        hits = [r for r in ex.map(probe, targets) if r]
+    # Keep the first surviving site per organisation, then let the model adjudicate. String rules got
+    # this wrong in both directions on the pilot data: a perfect name match sent "Mini Munchkins" in York
+    # to a Montessori nursery elsewhere, while a locality test strict enough to catch that threw away
+    # Pan Nation, whose own site never names the ward it hires in. It also mis-scored both ways by
+    # substring: "chester" matched inside "manchester". Deciding whether two things are the same
+    # organisation is a judgement, so ask the model that already names organisations in this pipeline.
+    # Measured on 30 contactless pilot rows: 7 resolved, all 7 correct on inspection.
+    first, seen_i = [], set()
+    for r in hits:
+        if r['i'] in seen_i: continue
+        seen_i.add(r['i']); first.append(r)
+    verdicts, jcost = same_org_verdicts(first, venue, pc, needles)
+    cost += jcost
+    for h, ok in zip(first, verdicts):
+        if not ok: continue
+        c = cands[h['i']]
+        if h['email']: c['email'] = h['email']
+        if h['phone']: c['phone'] = h['phone']
+        # Only claim it as their website when the domain itself spells them out. A profile on a niche
+        # directory can carry the right person's email while still not being their site, and storing it
+        # would repeat the deep-link problem fixed on 4 August.
+        if domain_carries_name(c['name'], h['dom']): c['website'] = f"https://{h['dom']}/"
+        c['own_site_url'] = h['url']
+        found += 1
+    return len(todo), round(cost, 4), found
+
+def same_org_verdicts(hits, venue, pc, needles):
+    """One call, all candidates: is this website the organisation's own?
+
+    Defaults to NO. A blank contact is a lead Vivify cannot ring; a wrong contact is Vivify ringing a
+    stranger about a booking they know nothing about, which is worse for them than the blank."""
+    if not hits: return [], 0.0
+    if not OPENAI_KEY: return [False] * len(hits), 0.0
+    items = [f'[{n}] organisation name: {h["name"]}\n    candidate site: {h["dom"]}\n'
+             f'    page title: {h["title"]}\n    page text: {h["text"]}'
+             for n, h in enumerate(hits)]
+    prompt = (
+        f'An organisation was found advertising an activity at "{venue}" ({pc}). For each numbered item '
+        f'below, decide whether the candidate website belongs to THAT organisation, the one operating at '
+        f'that venue — not merely to a different organisation with a similar or identical name somewhere '
+        f'else in the country.\n\n'
+        f'Words associated with the venue\'s area: {", ".join(sorted(needles))}.\n'
+        f'Treat a site that names the venue, that area, or a plainly compatible area as the same '
+        f'organisation. Treat a site whose stated location is clearly somewhere else as a different one. '
+        f'A national body\'s website is NOT the local branch\'s own site. If you cannot tell, answer false.\n\n'
+        f'Return ONLY a JSON array like [{{"n":0,"same":true}},...], one entry per item.\n\n'
+        + '\n\n'.join(items))
+    body = json.dumps({"model": "gpt-4o", "temperature": 0, "max_tokens": 800,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    try:
+        r = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body,
+            headers={"Authorization": "Bearer " + OPENAI_KEY, "Content-Type": "application/json"})
+        d = json.load(urllib.request.urlopen(r, timeout=120))
+        u = d.get('usage', {})
+        cost = round(u.get('prompt_tokens', 0) / 1e6 * 2.50 + u.get('completion_tokens', 0) / 1e6 * 10.0, 4)
+        arr = json.loads(re.search(r'\[[\s\S]*\]', d['choices'][0]['message']['content']).group(0))
+    except Exception as e:
+        sys.stderr.write(f"same-org err {e}\n")
+        return [False] * len(hits), 0.0
+    out = [False] * len(hits)
+    for it in arr:
+        if isinstance(it, dict) and isinstance(it.get('n'), int) and 0 <= it['n'] < len(out):
+            out[it['n']] = bool(it.get('same'))
+    return out, cost
 
 DEDUPE_STOP = {'the','and','of','in','at','uk','ltd','limited','cic','stockport','manchester','london','group'}
 def _key_tokens(name):
@@ -929,11 +1162,14 @@ def run(sid, force=False):
     t_c = time.time()
     pages = fill_contacts(survivors)
     print(f"  contacts: {pages} pages in {time.time()-t_c:.0f}s")
+    t_o = time.time()
+    looked, own_cost, gained = find_own_sites(survivors, pc, own)
+    print(f"  own-site lookup: {looked} without a contact, {gained} resolved in {time.time()-t_o:.0f}s (${own_cost})")
     kept = [to_result(c) for c in survivors]
     apify_cost = 0.05 if fb else 0.0
     g_calls = 1 if GPLACES else 0
     g_cost = round(0.032 * g_calls, 4)  # Places Text Search
-    total = round(dfs_cost + gate_cost + apify_cost + g_cost + site_cost, 4)
+    total = round(dfs_cost + gate_cost + apify_cost + g_cost + site_cost + own_cost, 4)
     with_contact = sum(1 for k in kept if k.get('email') or k.get('phone_number'))
     print(f"  kept {len(kept)} of {len(cands)} | {with_contact} with a contact")
     print(f"  SPEND: dataforseo=${dfs_cost} gate=${gate_cost} apify=${apify_cost} places=${g_cost} | total=${total}")
