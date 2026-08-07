@@ -220,6 +220,21 @@ def dfs(kw, depth=30, retries=2):
             if attempt == retries: sys.stderr.write(f"dfs err [{kw[:30]}]: {e}\n"); return [], 0.0
             time.sleep(1.5)
 
+def dfs_balance():
+    """Remaining DataForSEO credit, or None if it cannot be read.
+
+    Worth its own call because of how this fails otherwise. On 7 August the account hit zero and every
+    query returned 402 Payment Required. dfs() logs that to stderr and returns an empty list, so a search
+    ran to completion, found almost nothing, and reported itself complete. To Vivify that is
+    indistinguishable from a venue with no hirers, and nothing anywhere said the reason was money."""
+    try:
+        req = urllib.request.Request("https://api.dataforseo.com/v3/appendix/user_data",
+                                     headers={"Authorization": "Basic " + DFS_AUTH})
+        d = json.load(urllib.request.urlopen(req, timeout=20))
+        return float(((d.get('tasks') or [{}])[0].get('result') or [{}])[0]['money']['balance'])
+    except Exception:
+        return None
+
 def fetch(url, timeout=8):
     """One slow site should not hold up the search: a tight timeout plus a read cap means the worst
     case per page is bounded. (Page reading swung between 46s and 289s a run before this.)"""
@@ -1166,6 +1181,18 @@ def run(sid, force=False):
     if not UKPC_RE.fullmatch((pc or '').strip()):
         print(f"  refusing to run: '{pc}' is not a valid UK postcode")
         set_status(sid, 'error'); return
+    # Refuse to start rather than return an empty search. Discovery is ~49 DataForSEO queries; with no
+    # credit every one of them 402s and the search completes having found nothing, which reads to the
+    # customer as "this venue has no hirers" rather than "nobody paid the bill".
+    bal = dfs_balance()
+    if bal is not None and bal < 0.50:
+        print(f"  refusing to run: DataForSEO balance is ${bal:.2f}")
+        sreq("PATCH", "group_searches",
+             {"status": "failed",
+              "venue_note": "Search not run: the DataForSEO account is out of credit, so no results "
+                            "could be gathered. Top the account up and run this search again."},
+             params=f"?id=eq.{sid}")
+        return
     typed_pc = pc
     set_status(sid, 'searching')
     cname, cpc, own = resolve_venue(venue, pc)
