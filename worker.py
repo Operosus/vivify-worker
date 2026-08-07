@@ -243,18 +243,59 @@ def page_text(raw):
     return re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
         re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or '')))).strip()
 
+PROOF_STRONG = re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekly|every|'
+                          r'\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)|\d{1,2}\s*-\s*\d{1,2}\s*(?:am|pm))\b', re.I)
+PROOF_VERB = re.compile(r'\b(meet|meets|meeting|train|trains|training|held|hold|holds|run|runs|running|'
+                        r'play|plays|based|hire|hires|session|sessions|class|classes|practice|rehears)\w*\b', re.I)
+
+def _sentences(text):
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+|\s*\|\s*|\s+•\s+', text) if s.strip()]
+
+def _navish(s):
+    """A menu reads as many short capitalised words and almost no ordinary sentence structure."""
+    words = s.split()
+    if len(words) < 6: return False
+    capped = sum(1 for w in words if w[:1].isupper())
+    return capped / len(words) > 0.6 and not PROOF_VERB.search(s)
+
 def page_evidence(raw, venue, pc):
-    """The passage around the venue mention. Vivify reads this before ringing a club, so give them
-    enough to judge it (day, time, activity), not a clipped fragment."""
-    text = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ', re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw))))
+    """The sentence that PROVES this organisation uses this venue, then context around it.
+
+    The old version returned a fixed window either side of the venue mention, which on a page whose
+    navigation happens to list the venue gave Vivify a menu: "Foundation 3G Pitch Register Football
+    Foundation Pitch Finder Online Ticketing Contact Complaints Board Staff". Compare "Wednesday evening
+    7-8.30pm at Blenheim High school in Epsom". Both are true, only one lets somebody pick up the phone
+    and say why they are calling, and a lead Vivify cannot prove is not a lead they will use."""
+    text = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
+        re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or ''))))
+    if not text: return ''
+    needles = [n for n in (pc.lower(), venue.lower().split(',')[0][:18]) if n]
+
+    # The window, exactly as before. This is the floor: the card never gets less than it used to.
+    context = ''
     low = text.lower()
-    for needle in [pc.lower(), venue.lower().split(',')[0][:18]]:
+    for needle in needles:
         i = low.find(needle)
         if i >= 0:
             s, e = max(0, i - 600), min(len(text), i + 900)
-            out = text[s:e].strip()
-            return ('...' if s > 0 else '') + out + ('...' if e < len(text) else '')
-    return ''
+            context = ('...' if s > 0 else '') + text[s:e].strip() + ('...' if e < len(text) else '')
+            break
+    if not context:
+        return ''
+
+    # If a sentence in that window actually states the thing (a day, a time, "we train at"), lead with it.
+    # Plenty of club sites are pure navigation and have no sentence at all, which is why this only ever
+    # adds a line rather than replacing the passage.
+    best, best_score = '', 0
+    for s in _sentences(context):
+        if not any(x in s.lower() for x in needles) or _navish(s) or len(s) < 25:
+            continue
+        sc = (2 if PROOF_STRONG.search(s) else 0) + (1 if PROOF_VERB.search(s) else 0)
+        if sc > best_score:
+            best, best_score = s, sc
+    if best and not context.lstrip('. ').startswith(best[:40]):
+        return f"{best}\n\n{context}"[:1800]
+    return context[:1500]
 
 DATE_META = [r'(?is)<meta[^>]+property=["\']article:(?:published|modified)_time["\'][^>]+content=["\']([^"\']+)',
              r'(?is)<meta[^>]+itemprop=["\']date(?:Published|Modified)["\'][^>]+content=["\']([^"\']+)',
@@ -369,6 +410,12 @@ def contacts(raw, org_domain):
         if d.startswith('44'): d = '0' + d[2:]
         if len(d) not in (10, 11) or not d.startswith('0'): continue
         if d[1] not in '12378': continue
+        # Match valid_uk_phone in the database exactly, or we write numbers it then calls invalid.
+        # Only 01 numbers come in a 10-digit form (01297 35800); a 10-digit 03 or 07 is malformed,
+        # and "0341722133" was about to be stored as a contact.
+        if len(d) == 10 and d[1] != '1': continue
+        if d[1] == '2' and d[2] not in '03489': continue
+        if d[1] == '7' and d[2] not in '12345789': continue
         if d in PLACEHOLDER_PHONES or len(set(d)) <= 2: continue
         if d in '0123456789012345' or d in '0987654321098765': continue  # sequential
         phone = d; break
@@ -989,7 +1036,13 @@ def gate(cands, venue, pc):
     if not cands: return [], 0.0
     if not OPENAI_KEY:
         return [(True, ('confirmed' if c['tie'] == 'postcode' else 'likely'), '') for c in cands], 0.0
-    items = "\n".join(f"{i}. {c['name']} — {(c.get('snippet') or c.get('evidence') or '')[:200]}" for i, c in enumerate(cands))
+    # The evidence passage first and 700 characters of it, not 200 characters of the SERP snippet. The
+    # gate was deciding "does this text tie the organisation to this venue" while being shown a fragment
+    # of a different, shorter text than the one we store and show the customer: stored evidence averages
+    # 984 characters. It was answering on less than we hold.
+    items = "\n".join(
+        f"{i}. {c['name']} — {((c.get('evidence') or '') + ' ' + (c.get('snippet') or '')).strip()[:700]}"
+        for i, c in enumerate(cands))
     prompt = (
         f'A specific UK venue, "{venue}" (postcode {pc}), hires its facilities to OUTSIDE organisations: '
         f'community groups, sports clubs, dance/gym/arts providers, faith and cultural groups, tuition/language/'
