@@ -425,10 +425,11 @@ def contacts(raw, org_domain):
         if d.startswith('44'): d = '0' + d[2:]
         if len(d) not in (10, 11) or not d.startswith('0'): continue
         if d[1] not in '12378': continue
-        # Match valid_uk_phone in the database exactly, or we write numbers it then calls invalid.
-        # Only 01 numbers come in a 10-digit form (01297 35800); a 10-digit 03 or 07 is malformed,
-        # and "0341722133" was about to be stored as a contact.
-        if len(d) == 10 and d[1] != '1': continue
+        # Match valid_uk_phone in the database, or we write numbers it then calls invalid. 10-digit
+        # numbers are real for 01 areas (01297 35800, Lyme Regis) and for 0800 freephone (0800 838909),
+        # which plenty of small providers publish as their only number. A 10-digit 03 or 07 is
+        # malformed, and "0341722133" was about to be stored off a live page.
+        if len(d) == 10 and d[1] not in '18': continue
         if d[1] == '2' and d[2] not in '03489': continue
         if d[1] == '7' and d[2] not in '12345789': continue
         if d in PLACEHOLDER_PHONES or len(set(d)) <= 2: continue
@@ -1188,9 +1189,12 @@ def run(sid, force=False):
     if bal is not None and bal < 0.50:
         print(f"  refusing to run: DataForSEO balance is ${bal:.2f}")
         sreq("PATCH", "group_searches",
+             # venue_note is customer-facing. Vivify need to know the search did not run and that it is
+             # not their fault; they do not need to read about our supplier's billing. The detail goes
+             # to the console and to Dean through the stalled-search watchdog.
              {"status": "failed",
-              "venue_note": "Search not run: the DataForSEO account is out of credit, so no results "
-                            "could be gathered. Top the account up and run this search again."},
+              "venue_note": "This search could not run because of a temporary problem at our end, so no "
+                            "results were gathered. It has been reported and can be run again shortly."},
              params=f"?id=eq.{sid}")
         return
     typed_pc = pc
@@ -1243,7 +1247,10 @@ def run(sid, force=False):
     pages = fill_contacts(survivors)
     print(f"  contacts: {pages} pages in {time.time()-t_c:.0f}s")
     t_o = time.time()
-    looked, own_cost, gained = find_own_sites(survivors, pc, own)
+    # venue matters: it feeds locality_needles, which is how the adjudicator tells this venue's
+    # "Superstars" from an identically named business in another town. Omitting it silently weakened
+    # every live search while the test harness, which does pass it, kept looking correct.
+    looked, own_cost, gained = find_own_sites(survivors, pc, own, venue)
     print(f"  own-site lookup: {looked} without a contact, {gained} resolved in {time.time()-t_o:.0f}s (${own_cost})")
     kept = [to_result(c) for c in survivors]
     apify_cost = 0.05 if fb else 0.0
