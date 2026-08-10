@@ -143,6 +143,22 @@ GOOD_TYPES = ('school', 'primary_school', 'secondary_school', 'university', 'chu
 AREA_TYPES = ('locality', 'sublocality', 'sublocality_level_1', 'neighborhood', 'postal_code', 'postal_town',
               'political', 'route', 'administrative_area_level_1', 'administrative_area_level_2')
 
+# A trailing parenthetical is the user's own label, not part of the venue's name. Luke types
+# "Surbiton High School (Raynes Park)" to note which Vivify site he is comparing against, and left in
+# it poisons the whole search: 12 of the 49 queries become quoted searches for a phrase that appears
+# nowhere on the web, the venue-name tie can never match a page that names the school (only the
+# postcode ties), and the gate is told to reject anything that is not at "Raynes Park". Search the
+# venue, keep the label for display.
+VENUE_LABEL = re.compile(r'\s*\(([^()]{1,40})\)\s*$')
+def split_venue_label(v):
+    """("Surbiton High School (Raynes Park)") -> ("Surbiton High School", "Raynes Park")."""
+    v = (v or '').strip()
+    m = VENUE_LABEL.search(v)
+    if not m: return v, ''
+    base = VENUE_LABEL.sub('', v).strip()
+    # A name that is nothing but a parenthetical is not a label, it is the name.
+    return (base, m.group(1).strip()) if len(base) >= 4 else (v, '')
+
 def resolve_venue(venue, pc):
     """Canonicalise the typed venue via Google Places text search.
     Users type an AREA as often as a venue ("St John's Wood" for Harris Academy St John's Wood); every
@@ -1174,9 +1190,9 @@ def run(sid, force=False):
     hirers who appeared since last time, and a cached copy of the previous run can never do that."""
     s = get_search(sid)
     if not s: sys.exit(f"search {sid} not found")
-    venue = (s.get('venue_name') or s.get('search_name') or '').strip()
+    venue, label = split_venue_label(s.get('venue_name') or s.get('search_name') or '')
     pc = (s.get('postcode') or '').strip()
-    print(f"[{sid}] {venue} ({pc})")
+    print(f"[{sid}] {venue} ({pc})" + (f" [label: {label}]" if label else ""))
     # No postcode, no search. The postcode is the only thing that ties evidence to THIS venue rather
     # than a same-named place elsewhere, and running without one burns money on unusable results.
     if not UKPC_RE.fullmatch((pc or '').strip()):
@@ -1203,7 +1219,8 @@ def run(sid, force=False):
     print(f"  places={'on' if GPLACES else 'OFF'} resolved={cname!r} {cpc!r} own={own!r}")
     if (cname, cpc) != (venue, pc):
         print(f"  canonical: {cname} ({cpc}){' own site ' + own if own else ''}")
-        patch = {"venue_name": cname, "postcode": cpc}
+        # Keep the user's own label on the record they see. Only the search itself drops it.
+        patch = {"venue_name": cname + (f" ({label})" if label else ""), "postcode": cpc}
         # Say so when we searched a different postcode from the one typed. Silently correcting it means
         # a mistyped postcode belonging to ANOTHER school would be searched with nobody any the wiser.
         if collapse(cpc) != collapse(typed_pc):
