@@ -510,6 +510,8 @@ def queries_for(venue, pc, own=''):
     return q
 
 PAGE_WORKERS = int(ENV.get('PAGE_WORKERS', '24'))
+PAGE_BUDGET = int(ENV.get('PAGE_BUDGET', '300'))    # seconds for the whole page phase
+CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
 
 def tie_kind(blob, vcol, pcol, vtoks, oc):
     if pcol and pcol in blob: return 'postcode'
@@ -569,8 +571,23 @@ def discover_web(venue, pc, own=''):
     # anyway, so a wider pool costs no more CPU than a narrow one and hides the slow hosts behind the
     # fast ones. The old limit of 8 was set to stop CPU work starving the health check; the read budget
     # in fetch() is what actually bounds a bad page.
-    with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
-        results = list(ex.map(process_main, cands))
+    #
+    # The phase gets a deadline of its own because waiting for every page is not worth a search. The
+    # same step took 38 seconds for Kingston and never finished at all for Wimbledon, twice, and the
+    # whole search died at the 30-minute cap having written nothing. Neither the socket timeout, the
+    # read budget nor the parse explains it, so rather than guess a third time: take what came back,
+    # name the pages that did not, and carry on. Those names are the evidence for the next look.
+    results = []
+    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    futs = {ex.submit(process_main, c): c for c in cands}
+    done, pending = cf.wait(futs, timeout=PAGE_BUDGET)
+    for f in done:
+        try: results.append(f.result())
+        except Exception as e: sys.stderr.write(f"page err {e}\n")
+    if pending:
+        stuck = sorted({futs[f]['domain'] for f in pending})
+        print(f"  pages: gave up on {len(pending)} of {len(cands)} after {PAGE_BUDGET}s — {', '.join(stuck[:10])}")
+    ex.shutdown(wait=False, cancel_futures=True)
     print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
     if timings:
         f_tot = sum(t[0] for t in timings); p_tot = sum(t[1] for t in timings)
@@ -614,11 +631,18 @@ def discover_web(venue, pc, own=''):
                 page_date(raw), og_image(raw, su))
     t2 = time.time()
     if targets:
-        with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
-            for dom, title, su, tie, sname, ev, em, ph, edate, img in ex.map(process_sub, targets):
-                if tie and dom not in byd:
-                    byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname,
-                                'evidence': ev, 'evidence_date': edate, 'image': img, 'email': em, 'phone': ph}
+        # Same deadline treatment as the page phase above, for the same reason.
+        cex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+        cfuts = [cex.submit(process_sub, t) for t in targets]
+        cdone, cpending = cf.wait(cfuts, timeout=CRAWL_BUDGET)
+        for f in cdone:
+            try: dom, title, su, tie, sname, ev, em, ph, edate, img = f.result()
+            except Exception: continue
+            if tie and dom not in byd:
+                byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname,
+                            'evidence': ev, 'evidence_date': edate, 'image': img, 'email': em, 'phone': ph}
+        if cpending: print(f"  crawl: gave up on {len(cpending)} of {len(targets)} after {CRAWL_BUDGET}s")
+        cex.shutdown(wait=False, cancel_futures=True)
     print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
     out, seen_n = [], set()
     for dom, d in byd.items():
@@ -662,11 +686,18 @@ def fill_contacts(cands):
         _, raw = fetch(su)
         return (i, *contacts(raw, dom))
     # Same reasoning as the page phase: 26 contact pages took 555 seconds on 10 August, all of it spent
-    # waiting on a handful of slow hosts while the rest of the pool sat idle.
-    with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
-        for i, em, ph in ex.map(get, todo):
-            if em and not cands[i].get('email'): cands[i]['email'] = em
-            if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
+    # waiting on a handful of slow hosts while the rest of the pool sat idle, and a page that never
+    # comes back must not hold up a finished search.
+    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    futs = [ex.submit(get, t) for t in todo]
+    done, pending = cf.wait(futs, timeout=CRAWL_BUDGET)
+    for f in done:
+        try: i, em, ph = f.result()
+        except Exception: continue
+        if em and not cands[i].get('email'): cands[i]['email'] = em
+        if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
+    if pending: print(f"  contacts: gave up on {len(pending)} of {len(todo)} after {CRAWL_BUDGET}s")
+    ex.shutdown(wait=False, cancel_futures=True)
     return len(todo)
 
 # ---------------- own-site lookup ----------------
@@ -1332,3 +1363,9 @@ def run(sid, force=False):
 
 if __name__ == '__main__':
     run(int(sys.argv[1]), force='--force' in sys.argv[2:])
+    # Leave immediately rather than letting Python join the fetch threads on the way out. Abandoning a
+    # page is the whole point of the deadlines above, and a normal exit would sit waiting for exactly
+    # the thread we gave up on — the search would be finished and written, and the process would still
+    # be killed at the 30-minute cap and marked failed.
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(0)

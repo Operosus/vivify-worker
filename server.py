@@ -28,22 +28,32 @@ def run_search(sid, force=False):
     with LANES:
         _run_search(sid, force)
 
+def fail(sid):
+    """Mark the search failed — unless it already finished. A worker can write its results, mark the
+    search complete and then die on the way out; calling that an error throws away a good search and
+    shows Vivify a failure that isn't one."""
+    try:
+        s = worker.get_search(sid) or {}
+        if s.get('status') in ('complete', 'enriching'):
+            sys.stderr.write(f"worker for {sid} died after finishing — leaving status {s.get('status')}\n")
+            return
+        worker.set_status(sid, 'error')
+    except Exception:
+        pass
+
 def _run_search(sid, force=False):
     try:
         cmd = [sys.executable, WORKER_PY, str(sid)] + (['--force'] if force else [])
         p = subprocess.run(cmd, timeout=1800)
         if p.returncode != 0:
             sys.stderr.write(f"worker for {sid} exited {p.returncode}\n")
-            try: worker.set_status(sid, 'error')
-            except Exception: pass
+            fail(sid)
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"worker for {sid} timed out\n")
-        try: worker.set_status(sid, 'error')
-        except Exception: pass
+        fail(sid)
     except Exception:
         sys.stderr.write(f"worker error for {sid}:\n{traceback.format_exc()}\n")
-        try: worker.set_status(sid, 'error')
-        except Exception: pass
+        fail(sid)
 
 class Handler(BaseHTTPRequestHandler):
     def _cors(self):
