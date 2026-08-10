@@ -17,7 +17,18 @@ import worker
 PORT = int(os.environ.get('PORT', '10000'))
 WORKER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker.py')
 
+# Luke fires a run of venues one after another, so several searches land within seconds of each other.
+# Each one reads up to 200 pages on half a CPU, and three at once took longer than the 30-minute cap and
+# were killed with nothing to show for the DataForSEO spend. Two lanes, and the rest wait their turn:
+# a search that starts late still finishes, and the watchdog now times from when the run actually
+# started rather than from when the record was created, so queueing cannot be mistaken for a stall.
+LANES = threading.BoundedSemaphore(int(os.environ.get('WORKER_LANES', '2')))
+
 def run_search(sid, force=False):
+    with LANES:
+        _run_search(sid, force)
+
+def _run_search(sid, force=False):
     try:
         cmd = [sys.executable, WORKER_PY, str(sid)] + (['--force'] if force else [])
         p = subprocess.run(cmd, timeout=1800)

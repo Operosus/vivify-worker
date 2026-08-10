@@ -1151,7 +1151,12 @@ def get_search(sid):
     return rows[0] if rows else None
 
 def set_status(sid, status):
-    sreq("PATCH", "group_searches", {"status": status}, params=f"?id=eq.{sid}")
+    body = {"status": status}
+    # Stamp when THIS run began. The stalled-search watchdog used to measure from created_at, so
+    # re-running a search made earlier in the day was declared stalled before it had done anything.
+    if status == 'searching':
+        body["started_at"] = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime())
+    sreq("PATCH", "group_searches", body, params=f"?id=eq.{sid}")
 
 def cache_lookup(venue, pc, sid):
     since = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - 14*86400))
