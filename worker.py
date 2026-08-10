@@ -8,7 +8,7 @@ charity register by postcode, exact-postcode DB, Facebook posts) -> LLM gate (re
 
 Run:  python3 worker.py <search_id>
 """
-import os, re, json, base64, sys, html, time, concurrent.futures as cf, urllib.request, urllib.parse
+import os, re, json, base64, sys, html, time, faulthandler, concurrent.futures as cf, urllib.request, urllib.parse
 
 ENV = dict(os.environ)  # Render provides secrets as env vars
 _envfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -530,6 +530,7 @@ def queries_for(venue, pc, own=''):
 PAGE_WORKERS = int(ENV.get('PAGE_WORKERS', '24'))
 PAGE_BUDGET = int(ENV.get('PAGE_BUDGET', '300'))    # seconds for the whole page phase
 CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
+SEARCH_WALL = int(ENV.get('SEARCH_WALL', '900'))    # hard stop for a whole search, GIL or no GIL
 
 def tie_kind(blob, vcol, pcol, vtoks, oc):
     if pcol and pcol in blob: return 'postcode'
@@ -1304,6 +1305,13 @@ def run(sid, force=False):
                             "results were gathered. It has been reported and can be run again shortly."},
              params=f"?id=eq.{sid}")
         return
+    # A hard wall that does not need the interpreter to cooperate. Twice now a single host has wedged
+    # a fetch for twenty minutes while holding the GIL, which starves every deadline in this file —
+    # the 300-second page budget for St Mary's returned after 1,197 seconds because the waiting thread
+    # never got to run. faulthandler's timer lives in C, so it fires anyway: it prints the stack of
+    # every thread, which names the exact call that is stuck, and takes the process down. A search that
+    # dies at fifteen minutes with a traceback is worth more than one killed silently at thirty.
+    faulthandler.dump_traceback_later(SEARCH_WALL, exit=True)
     typed_pc = pc
     set_status(sid, 'searching')
     cname, cpc, own = resolve_venue(venue, pc)
@@ -1369,6 +1377,9 @@ def run(sid, force=False):
     print(f"  kept {len(kept)} of {len(cands)} | {with_contact} with a contact")
     print(f"  SPEND: dataforseo=${dfs_cost} gate=${gate_cost} apify=${apify_cost} places=${g_cost} | total=${total}")
     log_spend(sid, venue, pc, len(kept), dfs_cost, gate_cost, apify_cost, total)
+    # Past the point where anything can hang: from here it is two database calls, and being killed
+    # between them would leave the search half-written.
+    faulthandler.cancel_dump_traceback_later()
     sreq("POST", "rpc/process_venue_hirer_results", {
         "p_search_id": sid, "p_results": kept,
         "p_cost_google": g_cost, "p_cost_dataforseo": dfs_cost, "p_cost_apify": apify_cost,
