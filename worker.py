@@ -540,8 +540,14 @@ def discover_web(venue, pc, own=''):
     vmeta = (vcol, pcol, vtoks, oc)
     # Process each page AS IT IS FETCHED and discard the HTML — never hold all pages in memory
     # (that OOM-killed the worker on the 512MB instance). Each record is small.
+    # Where the page phase actually goes. Widening the pool from 8 to 24 moved 1,201 seconds to 1,003,
+    # which rules out "a few slow hosts holding a narrow pool" and says the cost is spread across every
+    # page. Record fetch and parse separately so the next change is aimed at the right one.
+    timings = []
     def process_main(c):
+        t_f = time.time()
         _, raw = fetch(c['url'])
+        t_p = time.time()
         text = strip_markup(raw)
         tie = tie_kind(page_blob(raw, c['snippet'], c['title'], text), *vmeta)
         rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
@@ -555,8 +561,10 @@ def discover_web(venue, pc, own=''):
                     rec['clinks'] = sublinks(raw, c['url'], c['domain'], ['contact', 'about'])
         else:
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
+        timings.append((t_p - t_f, time.time() - t_p, len(raw), c['domain']))
         return rec  # raw HTML dropped here
     t1 = time.time()
+    cpu0 = time.process_time()
     # These threads spend nearly all their life blocked on a socket, and Python serialises the parsing
     # anyway, so a wider pool costs no more CPU than a narrow one and hides the slow hosts behind the
     # fast ones. The old limit of 8 was set to stop CPU work starving the health check; the read budget
@@ -564,6 +572,12 @@ def discover_web(venue, pc, own=''):
     with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
         results = list(ex.map(process_main, cands))
     print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
+    if timings:
+        f_tot = sum(t[0] for t in timings); p_tot = sum(t[1] for t in timings)
+        slow = sorted(timings, reverse=True)[:5]
+        print(f"  page split: fetch {f_tot:.0f}s + parse {p_tot:.0f}s summed over {len(timings)} pages, "
+              f"cpu {time.process_time()-cpu0:.0f}s, {sum(t[2] for t in timings)/1e6:.1f}MB")
+        print("  slowest: " + " | ".join(f"{d} f{a:.0f}s p{b:.0f}s {c//1024}KB" for a, b, c, d in slow))
     byd, agg = {}, []
     for r in results:
         if not r['tie']: continue
