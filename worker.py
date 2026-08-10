@@ -42,7 +42,17 @@ NOISE = ['wikipedia.org','indeed.','reed.co.uk','totaljobs','glassdoor','tes.com
     'cylex','daynurseries','moovit','mapcarta','localeiq','propertistics','streetlist','streetcheck','doogal',
     'housepriceinflation','rentaroof','sharetobuy','bellway','data.parliament','wikimedia','rocketreach','flower-shops',
     'netmums','trip.com','klook','viator','timeout.com','nhs.uk','heyschools','heygolf','schoolratings','schoolsfootball','schoolsnetball','schoolsbasketball',
-    'allschools','schoolstogether','schoolowl','goodschools','locatethis','cleanair','primarytimes']
+    'allschools','schoolstogether','schoolowl','goodschools','locatethis','cleanair','primarytimes',
+    # Nothing here has ever been a venue hirer, and every one of them is a page we pay to fetch. They
+    # came off the slowest-page log on 10 August: usnews.com alone held a fetch open for 1,335 seconds
+    # and pegged the instance for 22 minutes, and books.google, alamy, niche and bloomberg were sitting
+    # in the same 200. US school directories arrive because "St Mary's Catholic High School" is a very
+    # common name.
+    'usnews.com','niche.com','greatschools','publicschoolreview','books.google','scholar.google','alamy',
+    'shutterstock','istockphoto','dreamstime','bloomberg','thetimes','telegraph.co.uk','dailymail',
+    'issuu.com','scribd','academia.edu','researchgate','jstor','bayut','arabiancampus','edarabia',
+    'greater.jobs','jobsgopublic','catholicrecruitment','wigantoday','thisislocallondon','standard.co.uk',
+    'expertini','glassdoor','ziprecruiter','trustpilot','yelp.com','crunchbase','bizapedia','opencorporates']
 AGG = ['charitycommission','findachurch','classforkids','pitchfinder','clubspark','playfootball','happity',
        'footyaddicts','hoop.co.uk','eventbrite','meetup','allevents','skiddle','ticketsource','fatsoma',
        'dice.fm','eventful','tickettailor','trybooking','bookwhen']
@@ -251,6 +261,14 @@ def dfs_balance():
     except Exception:
         return None
 
+class _FewRedirects(urllib.request.HTTPRedirectHandler):
+    """The socket timeout is per hop, so a ten-hop redirect chain costs ten times what it looks like.
+    Pages took 116 to 140 seconds each on the Wimbledon and St Mary's runs against an 8 second timeout;
+    three hops is plenty for a club website."""
+    max_redirections = 3
+    max_repeats = 2
+PAGE_OPENER = urllib.request.build_opener(_FewRedirects)
+
 def fetch(url, timeout=8, budget=15):
     """One slow site should not hold up the search: a tight timeout plus a read cap means the worst
     case per page is bounded. (Page reading swung between 46s and 289s a run before this.)
@@ -261,7 +279,7 @@ def fetch(url, timeout=8, budget=15):
     name had been returning. The read now gets a wall-clock budget of its own."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with PAGE_OPENER.open(req, timeout=timeout) as r:
             ctype = (r.headers.get('Content-Type') or '').lower()
             if ctype and 'html' not in ctype and 'text' not in ctype:
                 return url, ''  # PDFs and images cost time and never carry the evidence we want
