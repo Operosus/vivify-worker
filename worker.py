@@ -251,28 +251,44 @@ def dfs_balance():
     except Exception:
         return None
 
-def fetch(url, timeout=8):
+def fetch(url, timeout=8, budget=15):
     """One slow site should not hold up the search: a tight timeout plus a read cap means the worst
-    case per page is bounded. (Page reading swung between 46s and 289s a run before this.)"""
+    case per page is bounded. (Page reading swung between 46s and 289s a run before this.)
+
+    The socket timeout bounds each individual recv, not the page. A host that trickles bytes, or a
+    chain of redirects each getting its own eight seconds, sails past it: reading 200 real club sites
+    took 1,201 seconds on 10 August against 22-42 seconds for the aggregator pages the broken venue
+    name had been returning. The read now gets a wall-clock budget of its own."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             ctype = (r.headers.get('Content-Type') or '').lower()
             if ctype and 'html' not in ctype and 'text' not in ctype:
                 return url, ''  # PDFs and images cost time and never carry the evidence we want
-            return url, r.read(250000).decode('utf-8', 'ignore')
+            deadline, out, got = time.time() + budget, [], 0
+            while got < 250000:
+                chunk = r.read(65536)
+                if not chunk: break
+                out.append(chunk); got += len(chunk)
+                if time.time() > deadline: break  # keep what arrived, stop waiting for the rest
+            return url, b''.join(out).decode('utf-8', 'ignore')
     except Exception:
         return url, ''
 
-def page_blob(raw, snippet, title):
-    raw = re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw)
-    return collapse(title + ' ' + snippet + ' ' + html.unescape(re.sub(r'(?is)<[^>]+>', ' ', raw)))
+def strip_markup(raw):
+    """Scripts and styles out, tags out, entities decoded. This is the expensive pass over a page and
+    every caller that wants the words rather than the markup should do it once and pass the result on:
+    a tied page used to run it three times over the same quarter of a megabyte."""
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
+        re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or '')))).strip()
+
+def page_blob(raw, snippet, title, text=None):
+    return collapse(title + ' ' + snippet + ' ' + (strip_markup(raw) if text is None else text))
 
 def page_text(raw):
     """Readable text, for showing a page to the model. page_blob() collapses everything for substring
     matching, which is unreadable."""
-    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
-        re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or '')))).strip()
+    return strip_markup(raw)
 
 PROOF_STRONG = re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekly|every|'
                           r'\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)|\d{1,2}\s*-\s*\d{1,2}\s*(?:am|pm))\b', re.I)
@@ -289,7 +305,7 @@ def _navish(s):
     capped = sum(1 for w in words if w[:1].isupper())
     return capped / len(words) > 0.6 and not PROOF_VERB.search(s)
 
-def page_evidence(raw, venue, pc):
+def page_evidence(raw, venue, pc, text=None):
     """The sentence that PROVES this organisation uses this venue, then context around it.
 
     The old version returned a fixed window either side of the venue mention, which on a page whose
@@ -297,8 +313,7 @@ def page_evidence(raw, venue, pc):
     Foundation Pitch Finder Online Ticketing Contact Complaints Board Staff". Compare "Wednesday evening
     7-8.30pm at Blenheim High school in Epsom". Both are true, only one lets somebody pick up the phone
     and say why they are calling, and a lead Vivify cannot prove is not a lead they will use."""
-    text = re.sub(r'\s+', ' ', html.unescape(re.sub(r'(?is)<[^>]+>', ' ',
-        re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', raw or ''))))
+    text = strip_markup(raw) if text is None else text
     if not text: return ''
     needles = [n for n in (pc.lower(), venue.lower().split(',')[0][:18]) if n]
 
@@ -494,6 +509,8 @@ def queries_for(venue, pc, own=''):
     q += [f'site:{d} "{venue}"' for d in ['classforkids.io','happity.co.uk','playfootball.net','clubspark.lta.org.uk','pitchfinder.org.uk']]
     return q
 
+PAGE_WORKERS = int(ENV.get('PAGE_WORKERS', '24'))
+
 def tie_kind(blob, vcol, pcol, vtoks, oc):
     if pcol and pcol in blob: return 'postcode'
     if vcol and len(vcol) > 6 and vcol in blob: return 'venue'
@@ -525,10 +542,11 @@ def discover_web(venue, pc, own=''):
     # (that OOM-killed the worker on the 512MB instance). Each record is small.
     def process_main(c):
         _, raw = fetch(c['url'])
-        tie = tie_kind(page_blob(raw, c['snippet'], c['title']), *vmeta)
+        text = strip_markup(raw)
+        tie = tie_kind(page_blob(raw, c['snippet'], c['title'], text), *vmeta)
         rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
         if tie:
-            rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc)
+            rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc, text)
             rec['evidence_date'] = page_date(raw); rec['image'] = og_image(raw, c['url'])
             # own site OR a charity/church register page (those list the org's own contact) — not class/sport directories
             if not is_agg(c['domain']) or 'charitycommission' in c['domain'] or 'findachurch' in c['domain']:
@@ -539,9 +557,11 @@ def discover_web(venue, pc, own=''):
             rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
         return rec  # raw HTML dropped here
     t1 = time.time()
-    # 8 workers, not 16: one shared CPU, and saturating it starved the HTTP health check
-    # until Render killed the instance mid-search.
-    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+    # These threads spend nearly all their life blocked on a socket, and Python serialises the parsing
+    # anyway, so a wider pool costs no more CPU than a narrow one and hides the slow hosts behind the
+    # fast ones. The old limit of 8 was set to stop CPU work starving the health check; the read budget
+    # in fetch() is what actually bounds a bad page.
+    with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
         results = list(ex.map(process_main, cands))
     print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
     byd, agg = {}, []
@@ -572,14 +592,15 @@ def discover_web(venue, pc, own=''):
     def process_sub(t):
         dom, title, su = t
         _, raw = fetch(su)
-        tie = tie_kind(page_blob(raw, '', title), *vmeta)
+        text = strip_markup(raw)
+        tie = tie_kind(page_blob(raw, '', title, text), *vmeta)
         if not tie: return (dom, title, su, None, '', '', None, None, None, None)
         em, ph = contacts(raw, dom)
-        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc), em, ph,
+        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc, text), em, ph,
                 page_date(raw), og_image(raw, su))
     t2 = time.time()
     if targets:
-        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
             for dom, title, su, tie, sname, ev, em, ph, edate, img in ex.map(process_sub, targets):
                 if tie and dom not in byd:
                     byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname,
@@ -626,7 +647,9 @@ def fill_contacts(cands):
         i, dom, su = t
         _, raw = fetch(su)
         return (i, *contacts(raw, dom))
-    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+    # Same reasoning as the page phase: 26 contact pages took 555 seconds on 10 August, all of it spent
+    # waiting on a handful of slow hosts while the rest of the pool sat idle.
+    with cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
         for i, em, ph in ex.map(get, todo):
             if em and not cands[i].get('email'): cands[i]['email'] = em
             if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
