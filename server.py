@@ -82,6 +82,28 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/diag'):
             import socket, time as _t, urllib.parse as _up
             q = _up.parse_qs(_up.urlparse(self.path).query)
+            # ?conc=N repeats the same hosts N times at once. Sequentially they all answer in under a
+            # second from here, yet a search gives up on them, so the question is what our own
+            # concurrency does to them — DNS in particular, which no timeout in the worker bounds.
+            conc = int((q.get('conc', ['0'])[0]) or 0)
+            if conc:
+                import socket as _s, concurrent.futures as _cf, time as _tt
+                hl = [h.strip() for h in q.get('hosts', [''])[0].split(',') if h.strip()]
+                jobs = [hl[i % len(hl)] for i in range(conc)]
+                def probe(h):
+                    t = _tt.time()
+                    try:
+                        _s.getaddrinfo(h, 443, proto=_s.IPPROTO_TCP)
+                        return ('dns_ok', round(_tt.time() - t, 1))
+                    except Exception:
+                        return ('dns_fail', round(_tt.time() - t, 1))
+                t0 = _tt.time()
+                with _cf.ThreadPoolExecutor(max_workers=conc) as _ex:
+                    res = list(_ex.map(probe, jobs))
+                times = sorted(r[1] for r in res)
+                return self._send(200, {"conc": conc, "wall_s": round(_tt.time() - t0, 1),
+                                        "dns_ok": sum(1 for r in res if r[0] == 'dns_ok'),
+                                        "median_s": times[len(times) // 2], "worst_s": times[-1]})
             out = []
             for h in (q.get('hosts', [''])[0].split(',') if q.get('hosts') else []):
                 h = h.strip()
