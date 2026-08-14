@@ -533,8 +533,6 @@ PAGE_BUDGET = int(ENV.get('PAGE_BUDGET', '300'))    # seconds for the whole page
 CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
 SEARCH_WALL = int(ENV.get('SEARCH_WALL', '900'))    # hard stop for a whole search, GIL or no GIL
 FETCH_PROCS = int(ENV.get('FETCH_PROCS', '2'))      # child processes reading pages
-FETCH_CHUNK = int(ENV.get('FETCH_CHUNK', '10'))     # pages per child task: the most one wedge can cost
-CHUNK_BUDGET = int(ENV.get('CHUNK_BUDGET', '90'))   # a child's own attempt to finish tidily first
 
 def _page_rec(c, vmeta, venue, pc):
     """Fetch one candidate page and reduce it to the small record we keep. The HTML is dropped here and
@@ -559,66 +557,63 @@ def _page_rec(c, vmeta, venue, pc):
     rec['_t'] = (t_p - t_f, time.time() - t_p, len(raw))
     return rec
 
-def _page_chunk(arg):
-    """Runs in a CHILD process. Threads inside it are still free to wedge; that is the point — the
-    parent kills the whole child rather than trying to persuade a blocked socket read to return."""
-    cands, vmeta, venue, pc = arg
-    out = []
-    ex = cf.ThreadPoolExecutor(max_workers=min(PAGE_WORKERS, max(1, len(cands))))
-    futs = [ex.submit(_page_rec, c, vmeta, venue, pc) for c in cands]
-    done, _pending = cf.wait(futs, timeout=CHUNK_BUDGET)
-    for f in done:
-        try: out.append(f.result())
+def _page_stream(cands, vmeta, venue, pc, q):
+    """Runs in a CHILD process and posts each page back the moment it is done. Streaming rather than
+    returning a batch matters: whatever a child has already sent survives being killed. The first
+    version of this returned a chunk of ten at a time and lost the whole chunk to any one slow host in
+    it — St Mary's read 10 pages of 200 that way."""
+    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    for f in cf.as_completed([ex.submit(_page_rec, c, vmeta, venue, pc) for c in cands]):
+        try: q.put(f.result())
         except Exception: pass
-    ex.shutdown(wait=False, cancel_futures=True)
-    return out
+    q.put(None)
+
+def _contact_stream(todo, _vmeta, _venue, _pc, q):
+    """Same shape for the contact chase: (i, domain, url) in, (i, email, phone) out."""
+    def one(t):
+        i, dom, su = t
+        return (i, *contacts(fetch(su)[1], dom))
+    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    for f in cf.as_completed([ex.submit(one, t) for t in todo]):
+        try: q.put(f.result())
+        except Exception: pass
+    q.put(None)
+
+def in_children(items, fn, budget, vmeta=None, venue='', pc=''):
+    """Do the fetch work in child processes and take whatever they have sent by the deadline.
+
+    Every deadline that lived inside the search process failed, because a wedged fetch leaves the
+    interpreter unable to run the code that is supposed to give up on it: St Mary's had a 300-second
+    page budget and came back after 1,197, three times, losing the whole search each time. The parent
+    here holds the clock and never touches a socket, so nothing a child does can stop it giving up, and
+    SIGTERM needs no cooperation from a blocked read."""
+    if not items: return []
+    ctx = mp.get_context('fork')
+    q = ctx.Queue()
+    parts = [p for p in (items[i::FETCH_PROCS] for i in range(FETCH_PROCS)) if p]
+    procs = [ctx.Process(target=fn, args=(part, vmeta, venue, pc, q), daemon=True) for part in parts]
+    for p in procs: p.start()
+    got, finished, deadline = [], 0, time.time() + budget
+    while finished < len(procs):
+        left = deadline - time.time()
+        if left <= 0: break
+        try: item = q.get(timeout=left)
+        except Exception: break          # empty at the deadline
+        if item is None: finished += 1
+        else: got.append(item)
+    for p in procs:
+        if p.is_alive(): p.terminate()
+        p.join(5)
+    return got
 
 def read_pages(cands, vmeta, venue, pc, budget=None):
-    """Read the candidate pages in child processes, and kill them if they do not come back.
-
-    Every deadline that lived inside the search process failed, because a wedged fetch left the
-    interpreter unable to run the code that was supposed to give up on it: St Mary's had a 300-second
-    page budget and returned after 1,197, three times, losing the whole search each time. A separate
-    process has its own interpreter, so the parent's clock keeps running no matter what the child is
-    doing, and SIGTERM does not need the child's cooperation. Whatever those hosts do — and I could not
-    reproduce it off the box — it can now cost one chunk of pages instead of one search."""
+    """Candidate pages, read in children that can be killed. Returns (records, dropped domains, timings)."""
     if not cands: return [], set(), []
-    chunks = [cands[i:i + FETCH_CHUNK] for i in range(0, len(cands), FETCH_CHUNK)]
-    recs = in_children([(ch, vmeta, venue, pc) for ch in chunks], _page_chunk, budget or PAGE_BUDGET)
+    recs = in_children(cands, _page_stream, budget or PAGE_BUDGET, vmeta, venue, pc)
     seen_urls = {r['url'] for r in recs}
     timings = [(*r.pop('_t'), r['domain']) for r in recs if '_t' in r]
     dropped = {c['domain'] for c in cands if c['url'] not in seen_urls}
     return recs, dropped, timings
-
-def _contact_chunk(pairs):
-    """Also a child process: same reasoning as _page_chunk. (i, domain, url) in, (i, email, phone) out."""
-    out = []
-    ex = cf.ThreadPoolExecutor(max_workers=min(PAGE_WORKERS, max(1, len(pairs))))
-    futs = [ex.submit(lambda t: (t[0], *contacts(fetch(t[2])[1], t[1])), p) for p in pairs]
-    done, _p = cf.wait(futs, timeout=CHUNK_BUDGET)
-    for f in done:
-        try: out.append(f.result())
-        except Exception: pass
-    ex.shutdown(wait=False, cancel_futures=True)
-    return out
-
-def in_children(chunks, fn, budget):
-    """Run chunks of fetch work in child processes and take whatever has come back by the deadline.
-    The parent never waits on a socket, so its clock cannot be starved by whatever the child is doing."""
-    got = []
-    pool = mp.get_context('fork').Pool(processes=FETCH_PROCS)
-    deadline = time.time() + budget
-    try:
-        it = pool.imap_unordered(fn, chunks)
-        for _ in range(len(chunks)):
-            left = deadline - time.time()
-            if left <= 0: break
-            try: got.extend(it.next(timeout=left))
-            except (mp.TimeoutError, StopIteration): break
-            except Exception as e: sys.stderr.write(f"chunk err {e}\n")
-    finally:
-        pool.terminate(); pool.join()
-    return got
 
 def tie_kind(blob, vcol, pcol, vtoks, oc):
     if pcol and pcol in blob: return 'postcode'
@@ -736,8 +731,7 @@ def fill_contacts(cands):
     if not todo: return 0
     # Child processes here too: 26 contact pages once took 555 seconds, and a page that never comes
     # back must not hold up a search whose results are already found.
-    chunks = [todo[i:i + FETCH_CHUNK] for i in range(0, len(todo), FETCH_CHUNK)]
-    got = in_children(chunks, _contact_chunk, CRAWL_BUDGET)
+    got = in_children(todo, _contact_stream, CRAWL_BUDGET)
     for i, em, ph in got:
         if em and not cands[i].get('email'): cands[i]['email'] = em
         if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
