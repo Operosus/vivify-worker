@@ -408,6 +408,28 @@ ASSET_EXT = ('.css', '.js', '.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.
 EMAIL_BADDOM = ('sentry', 'wixpress', 'example.', 'schema.org', 'w3.org', 'googleapis', 'gstatic', 'cloudflare',
                 'jquery', 'bootstrap', 'fontawesome', '.min.', 'domain.com', 'email.com', 'yourdomain', 'sentry.io', 'gov.uk')
 EMAIL_RE = re.compile(r'[a-z0-9][a-z0-9._%+\-]*@[a-z0-9.\-]+\.[a-z]{2,}', re.I)
+# Belt and braces on top of scanning text rather than markup. A contact 200,000 characters into a page
+# is not one anybody was going to find, and the obfuscated-address pattern is the expensive one.
+TEXT_SCAN = int(ENV.get('TEXT_SCAN', '200000'))
+MARKUP_SCAN = int(ENV.get('MARKUP_SCAN', '250000'))
+OBF_SCAN = int(ENV.get('OBF_SCAN', '60000'))
+
+def emails_in(text):
+    """Every address in the text, found by walking the @ signs.
+
+    `EMAIL_RE.findall` over a whole page is quadratic: the local part can match a long run of ordinary
+    characters and then fail at the @, and it retries from the next character, and the next. On
+    playfinder.com's 256KB listing it never finished — minutes of the interpreter lock held, which is
+    what starved every deadline in this file. Anchoring on the @ and looking a bounded distance either
+    side is linear in the number of @ signs and finds exactly the same addresses."""
+    out = []
+    for m in re.finditer(r'@', text):
+        i = m.start()
+        left = re.search(r'[a-z0-9][a-z0-9._%+\-]{0,63}$', text[max(0, i - 64):i], re.I)
+        right = re.match(r'[a-z0-9.\-]{1,63}\.[a-z]{2,24}', text[i + 1:i + 96], re.I)
+        if left and right:
+            out.append(f"{left.group(0)}@{right.group(0)}".lower())
+    return out
 PHONE_RE = re.compile(r'(?:\+44\s?|\b0)(?:\d[\d\s().\-]{7,12}\d)')
 FREEMAIL = {'gmail.com','googlemail.com','hotmail.com','hotmail.co.uk','outlook.com','yahoo.com','yahoo.co.uk',
             'btinternet.com','live.co.uk','icloud.com','me.com','aol.com','sky.com','virginmedia.com'}
@@ -427,28 +449,47 @@ def _registrable(dom):
         return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
 
-OBF_RE = re.compile(r'([a-z0-9._%+\-]{2,})\s*(?:\[\s*(?:at|@)\s*\]|\(\s*(?:at|@)\s*\)|\s+at\s+)\s*'
-                    r'([a-z0-9\-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+|\.)\s*[a-z0-9\-]+)+)', re.I)
+OBF_AT = re.compile(r'\[\s*(?:at|@)\s*\]|\(\s*(?:at|@)\s*\)|\s+at\s+', re.I)
+OBF_LOCAL = re.compile(r'([a-z0-9._%+\-]{2,64})\s{0,3}$', re.I)   # "info [at]" — the space is the user's
+OBF_DOMAIN = re.compile(r'\s{0,3}([a-z0-9\-]{1,63}(?:\s{0,3}(?:\[\s{0,3}dot\s{0,3}\]|\(\s{0,3}dot\s{0,3}\)|\s{1,3}dot\s{1,3}|\.)'
+                        r'\s{0,3}[a-z0-9\-]{1,63}){1,4})', re.I)
 def deobfuscate(text):
-    """info [at] example [dot] org — small orgs hide their address this way and we were missing them."""
+    """info [at] example [dot] org — small orgs hide their address this way and we were missing them.
+
+    Anchored on the "at", for the same reason as emails_in: the single-pattern version was quadratic
+    and took 15.6 seconds over 51KB of one real page while holding the interpreter lock, against 0.8
+    seconds over 20KB of the same page. Each "at" now gets a bounded look either side."""
     out = []
-    for local, dom in OBF_RE.findall(text):
+    for m in OBF_AT.finditer(text):
+        lm = OBF_LOCAL.search(text[max(0, m.start() - 64):m.start()])
+        rm = OBF_DOMAIN.match(text[m.end():m.end() + 96])
+        if not (lm and rm): continue
+        local, dom = lm.group(1), rm.group(1)
         d = re.sub(r'\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+)\s*', '.', dom, flags=re.I)
         d = re.sub(r'\s+', '', d)
         if d.count('.') >= 1 and len(d.split('.')[-1]) >= 2 and re.fullmatch(r'[a-z0-9.\-]+', d, re.I):
             out.append(f"{local.lower()}@{d.lower()}")
     return out
 
-def contacts(raw, org_domain):
+def contacts(raw, org_domain, text=None):
     """Pull a VALIDATED email + phone from an org's own page. Rejects asset strings, placeholders, junk.
-    mailto:/tel: links are trusted first — they are what the org actually publishes as its contact."""
+    mailto:/tel: links are trusted first — they are what the org actually publishes as its contact.
+
+    The address and phone scans run over the page's WORDS, not its markup. Run over raw HTML they are
+    quadratic on the inline scripts and data URIs a big page carries, and on one real page —
+    playfinder.com's listing for this very school, 256KB — EMAIL_RE.findall and deobfuscate never
+    returned at all. A regex holds the interpreter lock while it runs, so that single page stalled every
+    thread in the process, starved every deadline meant to give up on it, and made the fetch timings
+    around it read as minutes. It is the whole of the "wedge" chased since 10 August. Scripts and styles
+    are already gone from the stripped text, which is where those blobs live."""
     if not raw: return None, None
-    text = html.unescape(raw)
-    linked = [m.lower().split('?')[0].strip() for m in re.findall(r'(?i)href=["\']mailto:([^"\'?>]+)', text)]
+    linkmarkup = raw[:MARKUP_SCAN]          # href scanning only; cheap and anchored to a quote
+    text = (strip_markup(raw) if text is None else text)[:TEXT_SCAN]
+    linked = [m.lower().split('?')[0].strip() for m in re.findall(r'(?i)href=["\']mailto:([^"\'?>]+)', linkmarkup)]
     # email
     email = None
     cands = []
-    for m in linked + EMAIL_RE.findall(text) + deobfuscate(text):
+    for m in linked + emails_in(text) + deobfuscate(text[:OBF_SCAN]):
         e = m.lower().strip('.')
         if e.count('@') != 1 or not EMAIL_RE.fullmatch(e): continue
         dom = e.split('@')[1]
@@ -469,7 +510,7 @@ def contacts(raw, org_domain):
         email = (pref[0] if pref else (pool[0] if pool else None))
     # phone (UK) — tel: links first, then anything phone-shaped in the text
     phone = None
-    tel = [re.sub(r'[^\d+]', '', m) for m in re.findall(r'(?i)href=["\']tel:([^"\'>]+)', text)]
+    tel = [re.sub(r'[^\d+]', '', m) for m in re.findall(r'(?i)href=["\']tel:([^"\'>]+)', linkmarkup)]
     for m in tel + PHONE_RE.findall(text):
         d = re.sub(r'\D', '', m)
         if d.startswith('44'): d = '0' + d[2:]
