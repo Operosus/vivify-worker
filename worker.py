@@ -1302,9 +1302,21 @@ def gate(cands, venue, pc):
         return [(True, ('confirmed' if c['tie'] == 'postcode' else 'likely'), '') for c in cands], 0.0
 
 # ---------------- supabase ----------------
+CTRL_CHARS = {c: None for c in range(32) if c not in (9, 10, 13)}
+CTRL_CHARS[0x7f] = None
+def scrub(o):
+    """Postgres text cannot hold a NUL, and web pages do contain them. Ashton on Mersey found ten
+    hirers, wrote none of them and exited 1 on "unsupported Unicode escape sequence": one page's
+    evidence carried a \\u0000. Everything bound for the database goes through here, so a stray control
+    character in scraped text can never again cost a whole search."""
+    if isinstance(o, str): return o.translate(CTRL_CHARS)
+    if isinstance(o, dict): return {k: scrub(v) for k, v in o.items()}
+    if isinstance(o, list): return [scrub(v) for v in o]
+    return o
+
 def sreq(method, path, payload=None, params=''):
     url = f"{SUPA}/rest/v1/{path}{params}"
-    data = json.dumps(payload).encode() if payload is not None else None
+    data = json.dumps(scrub(payload)).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
         headers={"apikey": SKEY, "Authorization": "Bearer " + SKEY, "Content-Type": "application/json", "Prefer": "return=representation"})
     try:
