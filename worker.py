@@ -1307,7 +1307,15 @@ def sreq(method, path, payload=None, params=''):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
         headers={"apikey": SKEY, "Authorization": "Bearer " + SKEY, "Content-Type": "application/json", "Prefer": "return=representation"})
-    return json.load(urllib.request.urlopen(req, timeout=30))
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=30))
+    except urllib.error.HTTPError as e:
+        # Postgres says exactly what it did not like; "HTTP Error 400: Bad Request" on its own sent me
+        # looking in the wrong place for an hour when a search died writing its results.
+        detail = ''
+        try: detail = e.read().decode('utf-8', 'ignore')[:400]
+        except Exception: pass
+        raise RuntimeError(f"{method} {path} -> {e.code}: {detail}") from None
 
 SPEND_LOG = os.path.join(os.path.dirname(__file__), 'spend_log.csv')
 def log_spend(sid, venue, pc, kept, dfs_c, gate_c, apify_c, total):
