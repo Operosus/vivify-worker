@@ -533,6 +533,7 @@ PAGE_BUDGET = int(ENV.get('PAGE_BUDGET', '300'))    # seconds for the whole page
 CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
 SEARCH_WALL = int(ENV.get('SEARCH_WALL', '900'))    # hard stop for a whole search, GIL or no GIL
 FETCH_PROCS = int(ENV.get('FETCH_PROCS', '2'))      # child processes reading pages
+PAGE_INFLIGHT = int(ENV.get('PAGE_INFLIGHT', '110'))  # pages a child will have open at once
 
 def _page_rec(c, vmeta, venue, pc):
     """Fetch one candidate page and reduce it to the small record we keep. The HTML is dropped here and
@@ -562,7 +563,11 @@ def _page_stream(cands, vmeta, venue, pc, q):
     returning a batch matters: whatever a child has already sent survives being killed. The first
     version of this returned a chunk of ten at a time and lost the whole chunk to any one slow host in
     it — St Mary's read 10 pages of 200 that way."""
-    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    # Every page gets its own thread rather than queueing for one of 24. On this venue 179 of 200 hosts
+    # never answer from Render at all, so a queue means the hung ones hold every slot and the pages that
+    # would have come back never get a turn: 21 of 200 read, with the 21 taking 37 seconds between them.
+    # A blocked socket costs a sleeping thread and nothing else, and the child is killed regardless.
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, min(len(cands), PAGE_INFLIGHT)))
     for f in cf.as_completed([ex.submit(_page_rec, c, vmeta, venue, pc) for c in cands]):
         try: q.put(f.result())
         except Exception: pass
@@ -573,7 +578,7 @@ def _contact_stream(todo, _vmeta, _venue, _pc, q):
     def one(t):
         i, dom, su = t
         return (i, *contacts(fetch(su)[1], dom))
-    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, min(len(todo), PAGE_INFLIGHT)))
     for f in cf.as_completed([ex.submit(one, t) for t in todo]):
         try: q.put(f.result())
         except Exception: pass
