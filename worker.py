@@ -8,7 +8,8 @@ charity register by postcode, exact-postcode DB, Facebook posts) -> LLM gate (re
 
 Run:  python3 worker.py <search_id>
 """
-import os, re, json, base64, sys, html, time, faulthandler, concurrent.futures as cf, urllib.request, urllib.parse
+import os, re, json, base64, sys, html, time, faulthandler, multiprocessing as mp
+import concurrent.futures as cf, urllib.request, urllib.parse
 
 ENV = dict(os.environ)  # Render provides secrets as env vars
 _envfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -531,6 +532,93 @@ PAGE_WORKERS = int(ENV.get('PAGE_WORKERS', '24'))
 PAGE_BUDGET = int(ENV.get('PAGE_BUDGET', '300'))    # seconds for the whole page phase
 CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
 SEARCH_WALL = int(ENV.get('SEARCH_WALL', '900'))    # hard stop for a whole search, GIL or no GIL
+FETCH_PROCS = int(ENV.get('FETCH_PROCS', '2'))      # child processes reading pages
+FETCH_CHUNK = int(ENV.get('FETCH_CHUNK', '10'))     # pages per child task: the most one wedge can cost
+CHUNK_BUDGET = int(ENV.get('CHUNK_BUDGET', '90'))   # a child's own attempt to finish tidily first
+
+def _page_rec(c, vmeta, venue, pc):
+    """Fetch one candidate page and reduce it to the small record we keep. The HTML is dropped here and
+    never leaves this function — holding a few hundred pages at once OOM-killed the 512MB instance."""
+    t_f = time.time()
+    _, raw = fetch(c['url'])
+    t_p = time.time()
+    text = strip_markup(raw)
+    vtoks, oc = vmeta[2], vmeta[3]
+    tie = tie_kind(page_blob(raw, c['snippet'], c['title'], text), *vmeta)
+    rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
+    if tie:
+        rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc, text)
+        rec['evidence_date'] = page_date(raw); rec['image'] = og_image(raw, c['url'])
+        # own site OR a charity/church register page (those list the org's own contact) — not class/sport directories
+        if not is_agg(c['domain']) or 'charitycommission' in c['domain'] or 'findachurch' in c['domain']:
+            rec['email'], rec['phone'] = contacts(raw, c['domain'])
+            if not is_agg(c['domain']) and not rec.get('email') and not rec.get('phone'):
+                rec['clinks'] = sublinks(raw, c['url'], c['domain'], ['contact', 'about'])
+    else:
+        rec['links'] = sublinks(raw, c['url'], c['domain'], list(vtoks) + [oc])
+    rec['_t'] = (t_p - t_f, time.time() - t_p, len(raw))
+    return rec
+
+def _page_chunk(arg):
+    """Runs in a CHILD process. Threads inside it are still free to wedge; that is the point — the
+    parent kills the whole child rather than trying to persuade a blocked socket read to return."""
+    cands, vmeta, venue, pc = arg
+    out = []
+    ex = cf.ThreadPoolExecutor(max_workers=min(PAGE_WORKERS, max(1, len(cands))))
+    futs = [ex.submit(_page_rec, c, vmeta, venue, pc) for c in cands]
+    done, _pending = cf.wait(futs, timeout=CHUNK_BUDGET)
+    for f in done:
+        try: out.append(f.result())
+        except Exception: pass
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+def read_pages(cands, vmeta, venue, pc, budget=None):
+    """Read the candidate pages in child processes, and kill them if they do not come back.
+
+    Every deadline that lived inside the search process failed, because a wedged fetch left the
+    interpreter unable to run the code that was supposed to give up on it: St Mary's had a 300-second
+    page budget and returned after 1,197, three times, losing the whole search each time. A separate
+    process has its own interpreter, so the parent's clock keeps running no matter what the child is
+    doing, and SIGTERM does not need the child's cooperation. Whatever those hosts do — and I could not
+    reproduce it off the box — it can now cost one chunk of pages instead of one search."""
+    if not cands: return [], set(), []
+    chunks = [cands[i:i + FETCH_CHUNK] for i in range(0, len(cands), FETCH_CHUNK)]
+    recs = in_children([(ch, vmeta, venue, pc) for ch in chunks], _page_chunk, budget or PAGE_BUDGET)
+    seen_urls = {r['url'] for r in recs}
+    timings = [(*r.pop('_t'), r['domain']) for r in recs if '_t' in r]
+    dropped = {c['domain'] for c in cands if c['url'] not in seen_urls}
+    return recs, dropped, timings
+
+def _contact_chunk(pairs):
+    """Also a child process: same reasoning as _page_chunk. (i, domain, url) in, (i, email, phone) out."""
+    out = []
+    ex = cf.ThreadPoolExecutor(max_workers=min(PAGE_WORKERS, max(1, len(pairs))))
+    futs = [ex.submit(lambda t: (t[0], *contacts(fetch(t[2])[1], t[1])), p) for p in pairs]
+    done, _p = cf.wait(futs, timeout=CHUNK_BUDGET)
+    for f in done:
+        try: out.append(f.result())
+        except Exception: pass
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+def in_children(chunks, fn, budget):
+    """Run chunks of fetch work in child processes and take whatever has come back by the deadline.
+    The parent never waits on a socket, so its clock cannot be starved by whatever the child is doing."""
+    got = []
+    pool = mp.get_context('fork').Pool(processes=FETCH_PROCS)
+    deadline = time.time() + budget
+    try:
+        it = pool.imap_unordered(fn, chunks)
+        for _ in range(len(chunks)):
+            left = deadline - time.time()
+            if left <= 0: break
+            try: got.extend(it.next(timeout=left))
+            except (mp.TimeoutError, StopIteration): break
+            except Exception as e: sys.stderr.write(f"chunk err {e}\n")
+    finally:
+        pool.terminate(); pool.join()
+    return got
 
 def tie_kind(blob, vcol, pcol, vtoks, oc):
     if pcol and pcol in blob: return 'postcode'
@@ -559,60 +647,15 @@ def discover_web(venue, pc, own=''):
     cands.sort(key=lambda c: ('charitycommission' in c['domain']) or (pcol in collapse(c['title']+c['snippet'])) or (vcol in collapse(c['title']+c['snippet'])), reverse=True)
     cands = cands[:200]
     vmeta = (vcol, pcol, vtoks, oc)
-    # Process each page AS IT IS FETCHED and discard the HTML — never hold all pages in memory
-    # (that OOM-killed the worker on the 512MB instance). Each record is small.
-    # Where the page phase actually goes. Widening the pool from 8 to 24 moved 1,201 seconds to 1,003,
-    # which rules out "a few slow hosts holding a narrow pool" and says the cost is spread across every
-    # page. Record fetch and parse separately so the next change is aimed at the right one.
-    timings = []
-    def process_main(c):
-        t_f = time.time()
-        _, raw = fetch(c['url'])
-        t_p = time.time()
-        text = strip_markup(raw)
-        tie = tie_kind(page_blob(raw, c['snippet'], c['title'], text), *vmeta)
-        rec = {'domain': c['domain'], 'title': c['title'], 'snippet': c['snippet'], 'url': c['url'], 'tie': tie}
-        if tie:
-            rec['sitename'] = site_name(raw); rec['evidence'] = page_evidence(raw, venue, pc, text)
-            rec['evidence_date'] = page_date(raw); rec['image'] = og_image(raw, c['url'])
-            # own site OR a charity/church register page (those list the org's own contact) — not class/sport directories
-            if not is_agg(c['domain']) or 'charitycommission' in c['domain'] or 'findachurch' in c['domain']:
-                rec['email'], rec['phone'] = contacts(raw, c['domain'])
-                if not is_agg(c['domain']) and not rec.get('email') and not rec.get('phone'):
-                    rec['clinks'] = sublinks(raw, c['url'], c['domain'], ['contact', 'about'])
-        else:
-            rec['links'] = sublinks(raw, c['url'], c['domain'], vtoks + [oc])
-        timings.append((t_p - t_f, time.time() - t_p, len(raw), c['domain']))
-        return rec  # raw HTML dropped here
     t1 = time.time()
-    cpu0 = time.process_time()
-    # These threads spend nearly all their life blocked on a socket, and Python serialises the parsing
-    # anyway, so a wider pool costs no more CPU than a narrow one and hides the slow hosts behind the
-    # fast ones. The old limit of 8 was set to stop CPU work starving the health check; the read budget
-    # in fetch() is what actually bounds a bad page.
-    #
-    # The phase gets a deadline of its own because waiting for every page is not worth a search. The
-    # same step took 38 seconds for Kingston and never finished at all for Wimbledon, twice, and the
-    # whole search died at the 30-minute cap having written nothing. Neither the socket timeout, the
-    # read budget nor the parse explains it, so rather than guess a third time: take what came back,
-    # name the pages that did not, and carry on. Those names are the evidence for the next look.
-    results = []
-    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
-    futs = {ex.submit(process_main, c): c for c in cands}
-    done, pending = cf.wait(futs, timeout=PAGE_BUDGET)
-    for f in done:
-        try: results.append(f.result())
-        except Exception as e: sys.stderr.write(f"page err {e}\n")
-    if pending:
-        stuck = sorted({futs[f]['domain'] for f in pending})
-        print(f"  pages: gave up on {len(pending)} of {len(cands)} after {PAGE_BUDGET}s — {', '.join(stuck[:10])}")
-    ex.shutdown(wait=False, cancel_futures=True)
-    print(f"  pages: {len(cands)} read in {time.time()-t1:.0f}s")
+    results, dropped, timings = read_pages(cands, vmeta, venue, pc)
+    print(f"  pages: {len(results)} of {len(cands)} read in {time.time()-t1:.0f}s")
+    if dropped:
+        print(f"  pages: gave up on {len(dropped)} — {', '.join(sorted(dropped)[:10])}")
     if timings:
-        f_tot = sum(t[0] for t in timings); p_tot = sum(t[1] for t in timings)
         slow = sorted(timings, reverse=True)[:5]
-        print(f"  page split: fetch {f_tot:.0f}s + parse {p_tot:.0f}s summed over {len(timings)} pages, "
-              f"cpu {time.process_time()-cpu0:.0f}s, {sum(t[2] for t in timings)/1e6:.1f}MB")
+        print(f"  page split: fetch {sum(t[0] for t in timings):.0f}s + parse {sum(t[1] for t in timings):.0f}s "
+              f"summed over {len(timings)} pages, {sum(t[2] for t in timings)/1e6:.1f}MB")
         print("  slowest: " + " | ".join(f"{d} f{a:.0f}s p{b:.0f}s {c//1024}KB" for a, b, c, d in slow))
     byd, agg = {}, []
     for r in results:
@@ -639,29 +682,20 @@ def discover_web(venue, pc, own=''):
         if r['tie'] or r['domain'] in byd or is_agg(r['domain']): continue
         for su in r.get('links', []): targets.append((r['domain'], r['title'], su))
     targets = targets[:120]
-    def process_sub(t):
-        dom, title, su = t
-        _, raw = fetch(su)
-        text = strip_markup(raw)
-        tie = tie_kind(page_blob(raw, '', title, text), *vmeta)
-        if not tie: return (dom, title, su, None, '', '', None, None, None, None)
-        em, ph = contacts(raw, dom)
-        return (dom, title, su, tie, site_name(raw), page_evidence(raw, venue, pc, text), em, ph,
-                page_date(raw), og_image(raw, su))
     t2 = time.time()
     if targets:
-        # Same deadline treatment as the page phase above, for the same reason.
-        cex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
-        cfuts = [cex.submit(process_sub, t) for t in targets]
-        cdone, cpending = cf.wait(cfuts, timeout=CRAWL_BUDGET)
-        for f in cdone:
-            try: dom, title, su, tie, sname, ev, em, ph, edate, img = f.result()
-            except Exception: continue
-            if tie and dom not in byd:
-                byd[dom] = {'titles': [title], 'tie': tie, 'url': su, 'snippet': '', 'sitename': sname,
-                            'evidence': ev, 'evidence_date': edate, 'image': img, 'email': em, 'phone': ph}
-        if cpending: print(f"  crawl: gave up on {len(cpending)} of {len(targets)} after {CRAWL_BUDGET}s")
-        cex.shutdown(wait=False, cancel_futures=True)
+        # The crawl fetches arbitrary pages too, so it goes through the same child processes. A sub-page
+        # is just a candidate whose domain is the organisation's rather than the sub-page's own.
+        subs = [{'url': su, 'domain': dom, 'title': title, 'snippet': ''} for dom, title, su in targets]
+        srecs, sdropped, _ = read_pages(subs, vmeta, venue, pc, budget=CRAWL_BUDGET)
+        for r in srecs:
+            dom = r['domain']
+            if r['tie'] and dom not in byd:
+                byd[dom] = {'titles': [r['title']], 'tie': r['tie'], 'url': r['url'], 'snippet': '',
+                            'sitename': r.get('sitename', ''), 'evidence': r.get('evidence', ''),
+                            'evidence_date': r.get('evidence_date'), 'image': r.get('image'),
+                            'email': r.get('email'), 'phone': r.get('phone')}
+        if sdropped: print(f"  crawl: gave up on {len(subs) - len(srecs)} of {len(subs)} after {CRAWL_BUDGET}s")
     print(f"  crawl: {len(targets)} sub-pages in {time.time()-t2:.0f}s | {len(byd)} tied domains")
     out, seen_n = [], set()
     for dom, d in byd.items():
@@ -700,23 +734,14 @@ def fill_contacts(cands):
         urls = list(dict.fromkeys((c.get('clinks') or [])[:2] + [f"https://{dom}{p}" for p in CONTACT_PATHS]))
         for u in urls[:5]: todo.append((i, dom, u))
     if not todo: return 0
-    def get(t):
-        i, dom, su = t
-        _, raw = fetch(su)
-        return (i, *contacts(raw, dom))
-    # Same reasoning as the page phase: 26 contact pages took 555 seconds on 10 August, all of it spent
-    # waiting on a handful of slow hosts while the rest of the pool sat idle, and a page that never
-    # comes back must not hold up a finished search.
-    ex = cf.ThreadPoolExecutor(max_workers=PAGE_WORKERS)
-    futs = [ex.submit(get, t) for t in todo]
-    done, pending = cf.wait(futs, timeout=CRAWL_BUDGET)
-    for f in done:
-        try: i, em, ph = f.result()
-        except Exception: continue
+    # Child processes here too: 26 contact pages once took 555 seconds, and a page that never comes
+    # back must not hold up a search whose results are already found.
+    chunks = [todo[i:i + FETCH_CHUNK] for i in range(0, len(todo), FETCH_CHUNK)]
+    got = in_children(chunks, _contact_chunk, CRAWL_BUDGET)
+    for i, em, ph in got:
         if em and not cands[i].get('email'): cands[i]['email'] = em
         if ph and not cands[i].get('phone'): cands[i]['phone'] = ph
-    if pending: print(f"  contacts: gave up on {len(pending)} of {len(todo)} after {CRAWL_BUDGET}s")
-    ex.shutdown(wait=False, cancel_futures=True)
+    if len(got) < len(todo): print(f"  contacts: gave up on {len(todo)-len(got)} of {len(todo)} after {CRAWL_BUDGET}s")
     return len(todo)
 
 # ---------------- own-site lookup ----------------
