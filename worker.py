@@ -534,6 +534,8 @@ CRAWL_BUDGET = int(ENV.get('CRAWL_BUDGET', '120'))  # and for the sub-page crawl
 SEARCH_WALL = int(ENV.get('SEARCH_WALL', '900'))    # hard stop for a whole search, GIL or no GIL
 FETCH_PROCS = int(ENV.get('FETCH_PROCS', '2'))      # child processes reading pages
 PAGE_INFLIGHT = int(ENV.get('PAGE_INFLIGHT', '24'))   # pages a child will have open at once
+PAGE_SERVICE = ENV.get('PAGE_SERVICE', '')            # UK box that reads the pages; empty = read here
+PAGE_TOKEN = ENV.get('PAGE_TOKEN', '')
 
 def _page_rec(c, vmeta, venue, pc):
     """Fetch one candidate page and reduce it to the small record we keep. The HTML is dropped here and
@@ -611,10 +613,28 @@ def in_children(items, fn, budget, vmeta=None, venue='', pc=''):
         p.join(5)
     return got
 
+def read_remote(cands, vmeta, venue, pc, budget):
+    """Ask the UK box to read the pages. Reading them from Frankfurt is about eighteen times slower on
+    the same code and the same URLs (3,275 fetch-seconds against 180, single pages at 116 seconds
+    against an 8-second timeout), which is what made searches thin and slow. Returns None if the
+    service cannot be reached, so a box being down costs speed rather than the search."""
+    body = json.dumps({"token": PAGE_TOKEN, "cands": cands, "vmeta": list(vmeta),
+                       "venue": venue, "pc": pc, "budget": budget}).encode()
+    try:
+        req = urllib.request.Request(PAGE_SERVICE, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=budget + 60) as r:
+            return json.load(r).get('recs') or []
+    except Exception as e:
+        sys.stderr.write(f"page service unavailable ({e}); reading locally instead\n")
+        return None
+
 def read_pages(cands, vmeta, venue, pc, budget=None):
-    """Candidate pages, read in children that can be killed. Returns (records, dropped domains, timings)."""
+    """Candidate pages, read where the sites actually answer. Returns (records, dropped domains, timings)."""
     if not cands: return [], set(), []
-    recs = in_children(cands, _page_stream, budget or PAGE_BUDGET, vmeta, venue, pc)
+    budget = budget or PAGE_BUDGET
+    recs = read_remote(cands, vmeta, venue, pc, budget) if (PAGE_SERVICE and PAGE_TOKEN) else None
+    if recs is None:
+        recs = in_children(cands, _page_stream, budget, vmeta, venue, pc)
     seen_urls = {r['url'] for r in recs}
     timings = [(*r.pop('_t'), r['domain']) for r in recs if '_t' in r]
     dropped = {c['domain'] for c in cands if c['url'] not in seen_urls}
