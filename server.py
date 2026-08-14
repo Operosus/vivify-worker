@@ -76,6 +76,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # /diag?hosts=a.com,b.com — times DNS, TCP connect and the fetch separately for each host, from
+        # the box. Hosts this instance gives up on answer in under a second from a laptop, and the fix
+        # for a stalled resolver is nothing like the fix for a blocked IP range, so measure which it is.
+        if self.path.startswith('/diag'):
+            import socket, time as _t, urllib.parse as _up
+            q = _up.parse_qs(_up.urlparse(self.path).query)
+            out = []
+            for h in (q.get('hosts', [''])[0].split(',') if q.get('hosts') else []):
+                h = h.strip()
+                if not h: continue
+                row = {"host": h}
+                t0 = _t.time()
+                try:
+                    ip = socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP)[0][4][0]
+                    row["dns_s"] = round(_t.time() - t0, 1); row["ip"] = ip
+                except Exception as e:
+                    row["dns_s"] = round(_t.time() - t0, 1); row["dns_err"] = str(e)[:60]; out.append(row); continue
+                t1 = _t.time()
+                try:
+                    s = socket.create_connection((ip, 443), timeout=10); s.close()
+                    row["tcp_s"] = round(_t.time() - t1, 1)
+                except Exception as e:
+                    row["tcp_s"] = round(_t.time() - t1, 1); row["tcp_err"] = str(e)[:60]; out.append(row); continue
+                t2 = _t.time()
+                row["bytes"] = len(worker.fetch(f"https://{h}/")[1]); row["fetch_s"] = round(_t.time() - t2, 1)
+                out.append(row)
+            return self._send(200, {"diag": out})
         self._send(200, {"ok": True, "service": "vivify-venue-hirers"})
 
     def do_POST(self):
